@@ -1,0 +1,36 @@
+{
+  "name": "blackbox-ai-labs",
+  "owner": {
+    "name": "Blackbox AI Labs"
+  },
+  "description": "Skills from Blackbox AI Labs.",
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "crosstalk",
+      "source": "./plugins/crosstalk",
+      "description": "Session-to-session messaging and read-only consult between live Claude Code sessions on one machine. Default OFF, operator-gated.",
+      "category": "workflow",
+      "version": "1.2.2",
+      "author": {
+        "name": "Blackbox AI Labs"
+      },
+      "license": "MIT",
+      "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/crosstalk",
+      "repository": "https://github.com/BlackBox-ai-lab/plugins"
+    },
+    {
+      "name": "session-atlas",
+      "source": "./plugins/session-atlas",
+      "description": "The standing map of every Claude Code session on a machine: living HTML pages (search, gists, resume commands) plus an agent-safe find/resolve/import CLI. Multi-account aware, stdlib-only, no credentials \u2014 gists are written by your own session's model.",
+      "category": "workflow",
+      "version": "1.1.1",
+      "author": {
+        "name": "Blackbox AI Labs"
+      },
+      "license": "MIT",
+      "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/session-atlas",
+      "repository": "https://github.com/BlackBox-ai-lab/plugins"
+    }
+  ]
+}

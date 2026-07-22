@@ -1,0 +1,13 @@
+{
+  "name": "crosstalk",
+  "displayName": "Crosstalk",
+  "version": "1.2.2",
+  "description": "Session-to-session messaging for Claude Code: mailbox requests delivered at turn end, silent read-only consults of peer sessions, and operator-granted standing consult. Default OFF; every action operator-gated.",
+  "author": {
+    "name": "Blackbox AI Labs"
+  },
+  "license": "MIT",
+  "keywords": ["sessions", "messaging", "multi-agent", "orchestration"],
+  "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/crosstalk",
+  "repository": "https://github.com/BlackBox-ai-lab/plugins"
+}

@@ -1,0 +1,19 @@
+{
+  "name": "session-atlas",
+  "displayName": "Session Atlas",
+  "version": "1.1.1",
+  "description": "The standing map of every Claude Code session on a machine: living HTML pages (search, gists, resume commands) plus an agent-safe find/resolve/import CLI. Multi-account aware, stdlib-only, no credentials \u2014 gists are written by your own session's model.",
+  "author": {
+    "name": "Blackbox AI Labs"
+  },
+  "license": "MIT",
+  "keywords": [
+    "sessions",
+    "resume",
+    "atlas",
+    "search",
+    "multi-account"
+  ],
+  "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/session-atlas",
+  "repository": "https://github.com/BlackBox-ai-lab/plugins"
+}
