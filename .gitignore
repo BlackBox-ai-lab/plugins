@@ -3,3 +3,5 @@
 scratch_archive/
 # Machine-specific leak patterns for release-preflight (yours, not the world's).
 scripts/.leak-patterns.local
+
+scripts/.leak-allow.local

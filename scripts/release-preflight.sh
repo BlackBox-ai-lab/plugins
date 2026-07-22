@@ -93,6 +93,9 @@ sec "5. Nothing private leaks into a public repo"
 # Generic patterns only. Your own machine/host/user identifiers do NOT belong in a
 # public repo — not even as scanner patterns — so add them in an untracked file:
 #   scripts/.leak-patterns.local   (one extended-regex alternation, no newline)
+# Deliberately-public strings that would otherwise match (e.g. a brand contact
+# address) go one-per-line in:
+#   scripts/.leak-allow.local
 # or the RELEASE_LEAK_PATTERNS environment variable.
 # /home/<name> is flagged only for names that look real; synthetic fixture paths
 # like /home/x or /home/user are how tests are supposed to be written.
@@ -104,6 +107,7 @@ EXTRA=""
 if hits=$(grep -rniP "$LEAK" --include='*.md' --include='*.json' --include='*.sh' --include='*.py' \
           plugins/ .claude-plugin/ README.md docs/ scripts/ 2>/dev/null \
           | grep -v 'example\.\|placeholder' \
+          | { [ -f scripts/.leak-allow.local ] && grep -vFf scripts/.leak-allow.local || cat; } \
           | grep -v '^scripts/release-preflight\.sh:'); then   # this file defines the patterns
   bad "operator/machine details or credentials found:
 $hits"

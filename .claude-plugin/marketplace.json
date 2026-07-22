@@ -1,7 +1,8 @@
 {
   "name": "blackbox-ai-labs",
   "owner": {
-    "name": "Blackbox AI Labs"
+    "name": "Blackbox AI Labs",
+    "email": "blackboxailabs@gmail.com"
   },
   "description": "Skills from Blackbox AI Labs.",
   "version": "1.0.0",
@@ -13,7 +14,8 @@
       "category": "workflow",
       "version": "1.2.2",
       "author": {
-        "name": "Blackbox AI Labs"
+        "name": "Blackbox AI Labs",
+        "email": "blackboxailabs@gmail.com"
       },
       "license": "MIT",
       "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/crosstalk",
@@ -26,7 +28,8 @@
       "category": "workflow",
       "version": "1.1.1",
       "author": {
-        "name": "Blackbox AI Labs"
+        "name": "Blackbox AI Labs",
+        "email": "blackboxailabs@gmail.com"
       },
       "license": "MIT",
       "homepage": "https://github.com/BlackBox-ai-lab/plugins/tree/main/plugins/session-atlas",
