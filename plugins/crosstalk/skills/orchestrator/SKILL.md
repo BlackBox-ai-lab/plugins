@@ -27,7 +27,7 @@ disable-model-invocation: true
 
 **Conflict awareness:** the roster carries repo-root + branch per spoke. Two spokes in one repo → watch for overlapping scope; quiet-ask each about file scope when in doubt; direct them by `/crosstalk:request` (with your operator's awareness) — spokes never coordinate directly, that's the point of the hub.
 
-**Staleness:** `/crosstalk:team` flags spokes silent >2h. Escalation: tail-read → quiet-ask → tell your operator. (A spoke that parked a wake watcher via `/crosstalk:watch` wakes within ~30 s of your `/crosstalk:request` even while idle — worth asking spokes to park one when you hand out work they'll idle after. An idle spoke with no watcher waits for its next keypress; there's no way to wake a spoke that never parked one — see the repo's docs/TMUX-WAKE.md for the reserved cross-session-wake alternative.)
+**Staleness:** `/crosstalk:team` flags spokes silent >2h. Escalation: tail-read → quiet-ask → tell your operator. (An idle spoke's mail waits for its next turn end or keypress — no wake mechanism, by design; see the repo's docs/TMUX-WAKE.md for the reserved alternative.)
 
 **Succession:** a spoke that hands off re-enlists as its successor automatically (its handoff doc carries the instruction); you'll get a succession report and the roster/alias update. Mail to the old id follows the forward pointer.
 

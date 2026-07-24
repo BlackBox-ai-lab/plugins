@@ -6,13 +6,8 @@
 # session end). Returning hookSpecificOutput.additionalContext on Stop
 # continues the conversation so the session can act on the delivered mail —
 # so a session that is WORKING drains its mailbox at the natural end of its
-# current turn, no keypress needed. Mail arriving during PURE idle is covered
-# by the WAKE WATCHER (session-mail-watch.sh), a run_in_background task the
-# model parks before idling: it exits when mail lands and the task-completion
-# notification wakes the session. So when the box is empty this hook NUDGES any
-# session that has a mailbox but no live watcher to park one — that keeps the
-# pattern self-maintaining. Only an idle session with no watcher still waits
-# for its user's next keypress (the UserPromptSubmit path).
+# current turn, no keypress needed. Mail arriving during PURE idle still waits
+# for the user's next prompt: no native mechanism can wake an idle session.
 #
 # SAFETY (do not weaken):
 #   * Gated on the same ENABLED master switch — a no-op when crosstalk is off.
@@ -41,20 +36,7 @@ MAX_PER_WINDOW=15
 shopt -s nullglob
 [ -d "$BOX" ] || exit 0
 files=("$BOX"/*.md)
-if [ ${#files[@]} -eq 0 ]; then
-  # Nothing to deliver — but keep this session WAKEABLE while idle: if no live
-  # wake watcher is parked, nudge the model to park one. Pid-gated, so a parked
-  # watcher = a silent stop, and a session that just parked is never re-nudged.
-  MARK="$HOME/.claude/session-mail/$SID/.watcher-pid"
-  if [ -f "$MARK" ]; then
-    wpid=$(cat "$MARK" 2>/dev/null)
-    [[ "$wpid" =~ ^[0-9]+$ ]] && kill -0 "$wpid" 2>/dev/null && exit 0
-  fi
-  WATCH="$(dirname "$(readlink -f "$0")")/session-mail-watch.sh"
-  jq -n --arg c "[crosstalk] No wake watcher is parked, so incoming mail can't wake this session while it's idle. Park one now — run Bash with run_in_background:true: bash $WATCH — then finish your turn. It costs zero tokens while parked; when mail lands it exits and wakes you." \
-    '{hookSpecificOutput:{hookEventName:"Stop",additionalContext:$c}}'
-  exit 0
-fi
+[ ${#files[@]} -eq 0 ] && exit 0   # nothing to deliver — stop normally
 
 # Rolling-window rate limit: prune old timestamps, count recent deliveries.
 now=$(date +%s)

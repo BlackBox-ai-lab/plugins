@@ -2,15 +2,13 @@
 
 **Status: designed, prototyped, deliberately NOT shipped.** Removed from the plugin at v1.2.0 to keep the operator's environment simple (no tmux dependency). This document preserves the complete design so it can be reinstated if the need materializes. Nothing in the shipped plugin depends on anything here.
 
-> **Superseded for the common case.** The `/crosstalk:watch` **wake watcher** now ships and closes the everyday idle gap *without tmux*: a session parks a `run_in_background` Bash task before idling, and that task's completion re-invokes the session when mail lands. That is a real harness mechanism the "no native mechanism" analysis below did not account for — it is not a timer hook (there still is none), it is a background-task completion notification. The tmux design here remains reserved only for what the watcher does **not** cover: spawning a fleet of builders, and waking a spoke that never parked a watcher (one session forcing another to act). Read the paragraph below with that correction in mind.
-
 ## The problem this solves
 
-Doc-verified against code.claude.com: **no hook event is timer- or idle-triggered.** The Notification hook fires when a session is *already* waiting but cannot inject context or start a turn (only UserPromptSubmit, PostToolUse, PostToolBatch, and Stop support `additionalContext`); and no CLI/socket/SDK surface injects a prompt into a running interactive session. (What the analysis missed, and the `/crosstalk:watch` watcher now exploits: the completion of a `run_in_background` Bash task *does* re-invoke an idle session — a wake signal without a timer hook. That closes the common idle gap; the remaining hole is below.)
+Doc-verified twice (2026-07-15 and 2026-07-21 against code.claude.com): **no native mechanism can wake an idle Claude Code session.** No hook event is timer- or idle-triggered; the Notification hook fires when a session is *already* waiting but cannot inject context or start a turn (only UserPromptSubmit, PostToolUse, PostToolBatch, and Stop support `additionalContext`); and no CLI/socket/SDK surface injects a prompt into a running interactive session.
 
-Consequence for crosstalk: mail for a **working** session lands at its next turn end (Stop hook — no keypress). An **idle** session that parked a watcher wakes on its own. The remaining hole is narrow — a fleet spoke that finished all its work, sits idle, and **never parked a watcher**, when the hub wants to hand it *new* work unattended.
+Consequence for crosstalk: mail for a **working** session lands at its next turn end (Stop hook — no keypress). Mail for a session **idle at its prompt** waits for its user's next keypress. That idle gap is the one delivery hole, and it only matters in one scenario: a fleet spoke finished all its work, sits idle, and the hub wants to hand it *new* work unattended.
 
-**The shipped position: park a watcher, else accept the residual gap.** Spokes in an active fleet are usually working (turn-end delivery) or can park a watcher (idle wake), so both common cases are covered. For a spoke that did neither, the escalation path is tail-read → quiet-ask → tell the operator.
+**The shipped position: accept the gap.** Spokes in an active fleet are usually working, so turn-end delivery covers the common case. The escalation path is tail-read → quiet-ask → tell the operator.
 
 ## The reserved solution: tmux as the actuator
 
@@ -45,6 +43,30 @@ The `FileChanged` hook event *can* fire while a session is idle and *can* run si
 ### Component 4 (alternative, no Claude Code involvement): external watcher service
 
 A tiny systemd **user** service running `inotifywait -m ~/.claude/session-mail/*/new/` that maps session id → tmux pane (from the roster) and fires `send-keys` on mail arrival. Fully automatic wake, zero footprint, cleanly separable from the plugin — but it's a daemon to install, monitor, and debug. Reserve for a genuine unattended-fleet need.
+
+### Component 5 (attempted v1.3.0, reverted v1.3.1): in-process background-task watcher
+
+A later attempt tried to close the idle gap *without* tmux: park a `run_in_background`
+Bash task before idling — a sleeping poll loop on the mailbox that exits when a `.md`
+lands, on the theory that a completing background task re-invokes an idle session (it
+does). **It shipped in v1.3.0 and was reverted in v1.3.1 — it does not work reliably and
+is actively harmful.** Two independent builder sessions confirmed the failure:
+
+1. **The harness reaps the task.** A `run_in_background` task does not survive an idle
+   session — it is killed mid-sleep when the session cycles a turn, spawns another
+   background task, or the Claude Code process tears down/restarts (empty task output ⇒
+   external kill, not a script exit; observed exit codes 1 and 144/signal-16). It parks
+   *alive* (verified live pid) and dies seconds-to-minutes later.
+2. **A killed task still wakes the session — with no mail.** So each spurious death
+   re-invokes the session, and the paired Stop-hook "no watcher parked, park one" nudge
+   fires again → park → die → nudge, an infinite loop that burns turns. This is the
+   loop an installer sees, not a wake channel.
+
+The lesson matches the finding at the top of this doc: **there is no reliable native way
+to wake a truly-idle session.** The honest position stands — turn-end / next-keypress
+delivery for active sessions, and the tmux actuator above as the only real idle-wake
+path, reserved until an unattended fleet needs it. Do not re-attempt the in-process
+watcher.
 
 ## Why it was backed out
 

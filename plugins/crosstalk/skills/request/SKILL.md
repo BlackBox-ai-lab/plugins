@@ -18,6 +18,6 @@ disable-model-invocation: true
 
 1. Resolve `<target>` per the protocol (UUID / short id / alias; follow any forward pointer). Shorthand: if the arguments simply *start* with a session id or alias, that's the target and the rest is the message intent.
 2. **You author the message** — the user gives intent, you write the briefing. Assume the reader has ZERO shared context: state the ask explicitly, give repo paths, reference files by absolute path, front-load a ≤8-line summary, and include the `Reply-to` header so the answer can come back. Write it to the target's mailbox in the protocol's message format.
-3. Tell the user: delivery is automatic — a **working** target picks it up at the end of its current turn (no keypress); an **idle** target that parked a wake watcher (`/crosstalk:watch`) is woken within ~30 s, no human needed; an idle target with no watcher waits for its user's next message.
+3. Tell the user: delivery is automatic — a **working** target picks it up at the end of its current turn (no keypress); an **idle** one on its user's next message there. A truly idle session with no one at it can't be woken — the mail waits.
 
 Use `/crosstalk:quiet-ask` instead when the user wants an *answer from* the peer's context without the peer doing anything — request is for making the live session **act**.
