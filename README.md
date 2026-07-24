@@ -85,6 +85,12 @@ Sessions exchange operator-authorized mail through per-session mailboxes under `
 | `/crosstalk:read <target> [q]` | Mine a (possibly closed) session's transcript via subagent |
 | `/crosstalk:stop` | Tear down pair + all grants (keeps mailboxes) |
 
+### Wake on incoming mail while idle
+
+Your sessions can wake each other by mail. Normally an **idle** session — one parked at its prompt with nobody typing — wouldn't notice incoming crosstalk mail until you came back and pressed a key. Run `/crosstalk:watch` to park a **wake watcher**, and that gap closes: the idle session picks up incoming mail within ~30 seconds and acts on it, no human needed.
+
+You rarely type it yourself — when a session ends a turn with no watcher parked, a hook nudges it to park one, so the behavior maintains itself. The watcher costs **zero tokens** while parked (a background task that simply waits), and the master `ENABLED` switch still governs everything: like every crosstalk path, it changes only *when* operator-authorized mail lands, never *whether* sessions talk.
+
 ### Orchestration (hub & spokes)
 
 Run one session as the **hub** of a fleet of builder sessions: spokes push short delta reports to the hub (delivered at its turn ends); the hub holds read-only quiet-ask on every spoke; spokes never talk to each other — the hub is the only cross-spoke channel. A per-turn reminder keeps every role alive across context compaction.

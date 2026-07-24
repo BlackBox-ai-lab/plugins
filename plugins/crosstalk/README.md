@@ -89,6 +89,10 @@ claude plugin update crosstalk@blackbox-ai-labs
 | `/crosstalk:orchestrator` · `enlist` · `adopt` · `team` · `release` | Hub-and-spoke fleets (spokes self-register and report up) |
 | `/crosstalk:status` · `list` · `name` · `read` · `stop` · `clean` | State, targets, aliases, transcript mining, teardown, janitor |
 
+### Stay reachable while idle
+
+Crosstalk's one delivery gap used to be the **idle** session — one sitting at its prompt with nobody typing sees incoming mail only when its human comes back and presses a key. `/crosstalk:watch` closes it: park a **wake watcher** and the session picks up incoming mail within ~30 seconds and acts on it, no human needed. You rarely run it by hand — when a session ends a turn with no watcher parked, a hook nudges it to park one, so the behavior maintains itself. It costs **zero tokens** while parked (a background task that simply waits), and the `ENABLED` switch still governs everything: it changes only *when* authorized mail lands, never *whether* sessions talk.
+
 Full command reference, safety model, and design are in the
 [repository README](https://github.com/BlackBox-ai-lab/plugins) and
 [`SECURITY.md`](./SECURITY.md).
