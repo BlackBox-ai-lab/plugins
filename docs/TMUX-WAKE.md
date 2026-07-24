@@ -2,13 +2,15 @@
 
 **Status: designed, prototyped, deliberately NOT shipped.** Removed from the plugin at v1.2.0 to keep the operator's environment simple (no tmux dependency). This document preserves the complete design so it can be reinstated if the need materializes. Nothing in the shipped plugin depends on anything here.
 
+> **Superseded for the common case.** The `/crosstalk:watch` **wake watcher** now ships and closes the everyday idle gap *without tmux*: a session parks a `run_in_background` Bash task before idling, and that task's completion re-invokes the session when mail lands. That is a real harness mechanism the "no native mechanism" analysis below did not account for — it is not a timer hook (there still is none), it is a background-task completion notification. The tmux design here remains reserved only for what the watcher does **not** cover: spawning a fleet of builders, and waking a spoke that never parked a watcher (one session forcing another to act). Read the paragraph below with that correction in mind.
+
 ## The problem this solves
 
-Doc-verified twice (2026-07-15 and 2026-07-21 against code.claude.com): **no native mechanism can wake an idle Claude Code session.** No hook event is timer- or idle-triggered; the Notification hook fires when a session is *already* waiting but cannot inject context or start a turn (only UserPromptSubmit, PostToolUse, PostToolBatch, and Stop support `additionalContext`); and no CLI/socket/SDK surface injects a prompt into a running interactive session.
+Doc-verified against code.claude.com: **no hook event is timer- or idle-triggered.** The Notification hook fires when a session is *already* waiting but cannot inject context or start a turn (only UserPromptSubmit, PostToolUse, PostToolBatch, and Stop support `additionalContext`); and no CLI/socket/SDK surface injects a prompt into a running interactive session. (What the analysis missed, and the `/crosstalk:watch` watcher now exploits: the completion of a `run_in_background` Bash task *does* re-invoke an idle session — a wake signal without a timer hook. That closes the common idle gap; the remaining hole is below.)
 
-Consequence for crosstalk: mail for a **working** session lands at its next turn end (Stop hook — no keypress). Mail for a session **idle at its prompt** waits for its user's next keypress. That idle gap is the one delivery hole, and it only matters in one scenario: a fleet spoke finished all its work, sits idle, and the hub wants to hand it *new* work unattended.
+Consequence for crosstalk: mail for a **working** session lands at its next turn end (Stop hook — no keypress). An **idle** session that parked a watcher wakes on its own. The remaining hole is narrow — a fleet spoke that finished all its work, sits idle, and **never parked a watcher**, when the hub wants to hand it *new* work unattended.
 
-**The shipped position: accept the gap.** Spokes in an active fleet are usually working, so turn-end delivery covers the common case. The escalation path is tail-read → quiet-ask → tell the operator.
+**The shipped position: park a watcher, else accept the residual gap.** Spokes in an active fleet are usually working (turn-end delivery) or can park a watcher (idle wake), so both common cases are covered. For a spoke that did neither, the escalation path is tail-read → quiet-ask → tell the operator.
 
 ## The reserved solution: tmux as the actuator
 

@@ -69,7 +69,7 @@ Claude Code, or any network service.
 
 ## Crosstalk
 
-Sessions exchange operator-authorized mail through per-session mailboxes under `~/.claude/session-mail/`, delivered by hooks: a **working** session receives mail at the end of its current turn (no keypress); an **idle** one on its user's next prompt. A silent consult path answers questions from a peer session's full context via a throwaway read-only fork — the peer's live window never moves.
+Sessions exchange operator-authorized mail through per-session mailboxes under `~/.claude/session-mail/`, delivered by hooks: a **working** session receives mail at the end of its current turn (no keypress); an **idle** session that parked a wake watcher (`/crosstalk:watch`) is woken within ~30 s of mail landing; an idle session with no watcher gets it on its user's next prompt. A silent consult path answers questions from a peer session's full context via a throwaway read-only fork — the peer's live window never moves.
 
 | Verb | What it does |
 |---|---|
@@ -78,6 +78,7 @@ Sessions exchange operator-authorized mail through per-session mailboxes under `
 | `/crosstalk:quiet-ask <target> <q>` | A read-only fork of the peer's context answers; the peer never sees it |
 | `/crosstalk:observe <target>` · `unobserve` | Standing grant: this session may quiet-ask that peer on its own initiative (read-only, always surfaced) |
 | `/crosstalk:chatty <target>` | Mutual pair: both sides may quiet-ask each other + send short delta updates |
+| `/crosstalk:watch` | Park a background wake watcher so incoming mail wakes this idle session (no keypress) |
 | `/crosstalk:status` | Switch, pair, grants, mailbox counts at a glance |
 | `/crosstalk:list` | Recent sessions on this machine (targets) |
 | `/crosstalk:name <alias>` | Friendly alias for this session |
@@ -99,7 +100,7 @@ Run one session as the **hub** of a fleet of builder sessions: spokes push short
 
 Succession after a handoff is automatic: an enlisted session invoking a handoff gets a hook-injected reminder to put `enlist --succeeds` in the handoff doc; the successor reuses the alias, in-flight mail follows a forward pointer, and no old-session history is carried along.
 
-Delivery honesty: a **working** session receives mail at its next turn end with no keypress; a session **idle at its prompt** receives it on its user's next keypress — no native mechanism can wake an idle session (doc-verified). A reserved design for tmux-based wake + fleet spawning lives in [docs/TMUX-WAKE.md](docs/TMUX-WAKE.md); it is deliberately not shipped.
+Delivery honesty: a **working** session receives mail at its next turn end with no keypress; an **idle** session that parked a wake watcher (`/crosstalk:watch`) is woken within ~30 s of mail arriving — a harness-tracked background task's completion re-invokes the session, no keypress and no human needed; an idle session with no watcher still waits for its user's next keypress. No timer- or idle-triggered *hook* exists, so an unattended spoke that never parked a watcher stays a gap; a reserved tmux-based design for spawning + waking such fleets lives in [docs/TMUX-WAKE.md](docs/TMUX-WAKE.md) and is deliberately not shipped.
 
 Targets are session ids (full or first-8), or aliases from `/crosstalk:name`.
 

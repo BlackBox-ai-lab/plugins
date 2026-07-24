@@ -1,7 +1,7 @@
 {
   "name": "crosstalk",
   "displayName": "Crosstalk",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "Session-to-session messaging for Claude Code: mailbox requests delivered at turn end, silent read-only consults of peer sessions, and operator-granted standing consult. Default OFF; every action operator-gated.",
   "author": {
     "name": "Blackbox AI Labs"

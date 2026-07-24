@@ -15,9 +15,9 @@ Crosstalk introduces **no network surface, no credentials, and no privilege esca
 ## What could go wrong — threat by threat
 
 ### T1 · Autonomous action at turn end (the core power)
-The Stop hook delivers mail at the end of a *working* session's turn and continues the conversation so the session acts on it — **no human keypress**. This is the feature and the risk: one session can cause another to do work unattended.
-**Defenses:** default-OFF master switch; only explicitly-*sent* mail is ever delivered (a session never self-initiates a send); a `request` obligates only a *reply*, not arbitrary action; a rolling-window rate limit (15 autonomous deliveries per 300 s per session) bounds any back-and-forth; past the cap, mail waits for a human keypress.
-**Residual:** a working session will act on delivered mail without you watching. Mitigate by treating `request` as "assign a peer a task," not "remote-control it," and keeping the switch off when you're not orchestrating.
+The Stop hook delivers mail at the end of a *working* session's turn and continues the conversation so the session acts on it — **no human keypress**. The **wake watcher** (`/crosstalk:watch`) extends the same reach to an *idle* session that opted in by parking one: its own background task exits when mail lands, wakes the session, and the same Stop hook delivers. Either way the risk is identical — one session can cause another to do work unattended.
+**Defenses:** the watcher changes only *when* delivery happens, never *what* is delivered or *whether* — the full envelope still applies: default-OFF master switch (the watcher refuses to park when off); only explicitly-*sent* mail is ever delivered (a session never self-initiates a send, and parking a watcher is own-mailbox maintenance, not an outbound action); a `request` obligates only a *reply*, not arbitrary action; the rolling-window rate limit (15 autonomous deliveries per 300 s per session) bounds any back-and-forth regardless of which path woke the session; past the cap, mail waits for a human keypress.
+**Residual:** a working session — or an idle one that parked a watcher — will act on delivered mail without you watching. Mitigate by treating `request` as "assign a peer a task," not "remote-control it," and keeping the switch off when you're not orchestrating.
 
 ### T2 · Inter-agent prompt injection
 Delivered mail is untrusted text that enters another session's context. A session that has been compromised upstream (a poisoned web page it fetched, a malicious file in a repo it's editing) could craft mail to steer a peer.
@@ -53,7 +53,7 @@ Installing the plugin means its hook scripts run on every prompt (`UserPromptSub
 - No network calls, no telemetry, no outbound anything — purely local file IPC.
 - No privilege escalation — same OS user throughout.
 - No proactive sends, ever — standing grants authorize *read-only* consult only.
-- No waking of idle sessions — there is no mechanism to make an idle session act (a tmux-based option was designed and deliberately **not** shipped; see `docs/TMUX-WAKE.md`).
+- No waking of a session that hasn't opted in — the wake watcher only fires for a session that *itself* parked one (own-mailbox maintenance), and even then it delivers nothing but already-*sent*, operator-authorized mail. There is no mechanism to make a session that never parked a watcher act while idle, and no session can wake another (a tmux-based cross-session wake was designed and deliberately **not** shipped; see `docs/TMUX-WAKE.md`).
 - No writing inside any repo or worktree — zero in-tree footprint; `git status` never shows crosstalk.
 
 ## Hardening checklist for operators

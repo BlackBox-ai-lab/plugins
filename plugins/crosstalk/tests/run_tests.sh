@@ -122,6 +122,40 @@ ck "combo: grants present" bash -c "grep -q 'aaaabbbb (authwork)' <<<\"\$1\"" _ 
 out=$(printf '{}' | HOME="$FAKE" CLAUDE_CODE_SESSION_ID="" bash "$SCRIPTS/session-mail-check.sh"); rc=$?
 ck "no sid: clean exit" test "$rc" -eq 0
 
+echo "== 11. wake watcher: park writes marker, double-park no-ops, mail exits it =="
+WATCH="$SCRIPTS/session-mail-watch.sh"
+rm -rf "$BOX/new" "$BOX/.watcher-pid"; mkdir -p "$BOX/new"
+# (a) parking writes a pid marker holding a live pid (fast poll, background)
+CROSSTALK_WATCH_INTERVAL=1 HOME="$FAKE" bash "$WATCH" "$SID" >/dev/null 2>&1 &
+w1=$!
+for _ in $(seq 1 30); do [ -f "$BOX/.watcher-pid" ] && break; sleep 0.1; done
+ck "park: marker written" test -f "$BOX/.watcher-pid"
+ck "park: marker holds a live pid" bash -c 'p=$(cat "$1" 2>/dev/null); [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null' _ "$BOX/.watcher-pid"
+# (b) a second park is a no-op while the first is alive
+out=$(CROSSTALK_WATCH_INTERVAL=1 HOME="$FAKE" bash "$WATCH" "$SID" 2>&1); rc=$?
+ck "double-park: exit 0" test "$rc" -eq 0
+ck "double-park: says already parked" bash -c 'grep -q "already parked" <<<"$1"' _ "$out"
+ck "double-park: marker unchanged (first pid)" bash -c 'test "$(cat "$2")" = "$1"' _ "$w1" "$BOX/.watcher-pid"
+# (c) mail arrival makes the watcher exit and clean its marker
+printf 'Subject: wake\n\nTOKEN_WAKE\n' > "$BOX/new/wakemsg.md"
+for _ in $(seq 1 60); do kill -0 "$w1" 2>/dev/null || break; sleep 0.2; done
+ck "wake: watcher exited on mail" bash -c '! kill -0 "$1" 2>/dev/null' _ "$w1"
+ck "wake: marker cleaned" test ! -e "$BOX/.watcher-pid"
+wait "$w1" 2>/dev/null
+
+echo "== 12. stop.sh empty-box nudge: fires with no watcher, silent when one is alive =="
+rm -rf "$BOX/new" "$BOX/.watcher-pid"; mkdir -p "$BOX/new"
+out=$(stdin_json | HOME="$FAKE" bash "$SCRIPTS/session-mail-stop.sh")
+ck "nudge: valid Stop JSON" bash -c "jq -er '.hookSpecificOutput.hookEventName==\"Stop\"' >/dev/null <<<\"\$1\"" _ "$out"
+ck "nudge: mentions the wake watcher" bash -c "jq -r '.hookSpecificOutput.additionalContext' <<<\"\$1\" | grep -qi 'wake watcher'" _ "$out"
+ck "nudge: gives the watch script path" bash -c "jq -r '.hookSpecificOutput.additionalContext' <<<\"\$1\" | grep -q 'session-mail-watch.sh'" _ "$out"
+# a live watcher parked -> the nudge stays silent
+sleep 300 & wlive=$!
+echo "$wlive" > "$BOX/.watcher-pid"
+out=$(stdin_json | HOME="$FAKE" bash "$SCRIPTS/session-mail-stop.sh"); rc=$?
+ck "nudge: silent when watcher alive" test "$rc" -eq 0 -a -z "$out"
+kill "$wlive" 2>/dev/null; rm -f "$BOX/.watcher-pid"
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 exit "$FAIL"

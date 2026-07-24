@@ -36,10 +36,10 @@ Both work as plain CLI too, without the leading slash (`claude plugin marketplac
 `claude plugin install …`), if you'd rather script it.
 
 **Then run `/reload-plugins`** — that activates it in your current session, so you can
-keep going without restarting. The 18 verbs load as `/crosstalk:*`; the two hooks that
+keep going without restarting. The 19 verbs load as `/crosstalk:*`; the two hooks that
 deliver mail (`UserPromptSubmit`, `Stop`) are registered automatically by the install —
 there is nothing to wire by hand and nothing to add to your settings. Confirm with
-`claude plugin details crosstalk@blackbox-ai-labs`, which should report 18 skills and
+`claude plugin details crosstalk@blackbox-ai-labs`, which should report 19 skills and
 2 hooks.
 
 ### First run
@@ -85,6 +85,7 @@ claude plugin update crosstalk@blackbox-ai-labs
 | `/crosstalk:quiet-ask <target> <q>` | A read-only fork of the peer's context answers; the peer never sees it |
 | `/crosstalk:observe <target>` · `unobserve` | Standing grant: consult a peer on your own initiative (read-only, surfaced) |
 | `/crosstalk:chatty <target>` | Mutual pair: both may quiet-ask + send short updates |
+| `/crosstalk:watch` | Park a background wake watcher so incoming mail wakes THIS session while it's idle (no keypress) |
 | `/crosstalk:orchestrator` · `enlist` · `adopt` · `team` · `release` | Hub-and-spoke fleets (spokes self-register and report up) |
 | `/crosstalk:status` · `list` · `name` · `read` · `stop` · `clean` | State, targets, aliases, transcript mining, teardown, janitor |
 

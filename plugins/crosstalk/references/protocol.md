@@ -37,10 +37,11 @@ Sent: <ISO timestamp>
 
 ## Delivery mechanics
 
-Two hook paths, one shared drainer, both gated on `ENABLED`:
+Three paths, one shared drainer, all gated on `ENABLED`:
 - **Active** (Stop hook): a *working* recipient gets mail at the end of its current turn, no keypress — rate-limited to 15 autonomous deliveries per 300 s per session.
-- **Passive** (UserPromptSubmit hook): an *idle* recipient gets mail on its user's next prompt (any message).
-A truly idle session cannot be woken (verified against the docs — no native mechanism exists); mail waits for whichever comes first.
+- **Wakeable idle** (wake watcher): an *idle* recipient that parked a watcher via `/crosstalk:watch` is woken within ~30 s of mail landing — the watcher is a harness-tracked background task whose completion re-invokes the session, which then drains via the Stop hook. No keypress, no human.
+- **Passive** (UserPromptSubmit hook): an *idle* recipient with **no** watcher gets mail on its user's next prompt (any message).
+So a purely idle session is no longer a dead end: park a watcher and it wakes on its own; without one, mail waits for the next keypress. Mail waits for whichever path fires first.
 Messages ≤2 KB inline in full; larger arrive excerpt-only with a `FULL BODY:` pointer — dispatch a subagent to distill that file, never Read it into main context.
 
 ## Receiving mail (context block starting `[crosstalk]`)
