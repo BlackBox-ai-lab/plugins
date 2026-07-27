@@ -115,6 +115,37 @@ else
   ok "no usernames, hostnames, home paths, or credential patterns"
 fi
 
+sec "5b. TruffleHog secret scan (working tree + FULL git history, fail-closed)"
+# The pattern grep above sees only the working tree; deleted files and old commits
+# still ship in every clone. This stage scans the entire git history with real
+# secret detectors. Fail-closed by design: a missing scanner FAILS the gate rather
+# than silently skipping it, and is never auto-installed by this script.
+if command -v trufflehog >/dev/null; then
+  th_out=$(trufflehog git "file://$ROOT" --results=verified,unknown --fail --no-update --json 2>/dev/null)
+  th_status=$?
+  if [ "$th_status" -eq 0 ]; then
+    ok "trufflehog: no verified/unknown secrets in working tree or git history"
+  elif [ "$th_status" -eq 183 ]; then
+    th_summary=$(printf '%s\n' "$th_out" | python3 -c "
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: d = json.loads(line)
+    except ValueError: continue
+    git = ((d.get('SourceMetadata') or {}).get('Data') or {}).get('Git') or {}
+    print('  %s @ %s:%s (commit %.8s)' % (d.get('DetectorName','?'),
+          git.get('file','?'), git.get('line','?'), git.get('commit','')))
+" | sort -u | head -20)
+    bad "trufflehog found potential secrets (detector @ file:line — values withheld):
+$th_summary"
+  else
+    bad "trufflehog scan errored (exit $th_status) — treating as a failure, not a skip"
+  fi
+else
+  bad "trufflehog not installed — this scan is mandatory and fails closed. Install: https://github.com/trufflesecurity/trufflehog#floppy_disk-installation"
+fi
+
 sec "6. Licensing and per-plugin docs"
 python3 -c "
 import json;m=json.load(open('.claude-plugin/marketplace.json'))
