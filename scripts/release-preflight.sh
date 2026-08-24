@@ -186,6 +186,22 @@ else
   warn "could not determine visibility (gh not available)"
 fi
 
+sec "9b. GitHub records (PRs, issues, contributors — these outlive any history rewrite)"
+if command -v gh >/dev/null && slug=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null); then
+  ALLOWED_LOGINS="blackboxkd"   # the public Blackbox AI Labs account; the only identity that may appear
+  others=$( { gh api "repos/$slug/pulls?state=all&per_page=100" -q '.[].user.login' 2>/dev/null;
+              gh api "repos/$slug/issues?state=all&per_page=100" -q '.[].user.login' 2>/dev/null;
+              gh api "repos/$slug/contributors?per_page=100" -q '.[].login' 2>/dev/null; } \
+            | sort -u | grep -v -x -E "$(printf '%s' "$ALLOWED_LOGINS" | tr ' ' '|')" || true )
+  if [ -z "$others" ]; then
+    ok "every PR, issue and contributor is the Blackbox AI Labs account"
+  else
+    bad "other GitHub identities on this repo's records: $(printf '%s' "$others" | tr '\n' ' ')— PRs and issues cannot be deleted; see CLAUDE.md"
+  fi
+else
+  warn "could not read GitHub records (gh not available)"
+fi
+
 if [ "${1:-}" = "--rehearse" ]; then
   sec "10. Fresh-install rehearsal (throwaway HOME, exactly what a newcomer runs)"
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
