@@ -9,7 +9,7 @@ so there is nothing else to sign up for.
 
 | Plugin | What it gives you |
 |---|---|
-| **[crosstalk](plugins/crosstalk)** | Session-to-session messaging: full sessions on one machine that can message each other, silently consult each other's context, and self-organize into an orchestrator + builder fleet. Default OFF, every action operator-gated. |
+| **[crosstalk](plugins/crosstalk)** | Discipline and depth on top of Claude Code's native cross-session messaging: silently consult a peer session's context (idle or closed) without disturbing it, send properly briefed requests, arm standing read-only grants, and run an orchestrator + builder fleet. Every action verb operator-gated. |
 | **[session-atlas](plugins/session-atlas)** | The standing map of every session on a machine: living HTML pages (search, "where we left off" gists, resume commands) plus an agent-safe find/resolve/import CLI. No credentials — gists are written by your own session's model. |
 
 ## Install
@@ -61,7 +61,8 @@ plugin itself.
 
 - **A recent Claude Code.** Check with `claude --version`. If `/plugin` comes back as an
   unknown command, update first — see [Setup](https://code.claude.com/docs/en/setup).
-- **crosstalk** — `jq` on PATH. One machine: it connects sessions on the same host (any project, any worktree).
+- **crosstalk** — Claude Code **2.1.224 or newer** (it builds on the native `ListAgents` /
+  `SendMessage` tools) and `jq` on PATH. Sessions on one machine, any project, any worktree.
 - **session-atlas** — Python 3 (standard library only). No API key: the engine never calls a model.
 
 Neither plugin needs an Anthropic API key, an account beyond the one already running
@@ -69,55 +70,52 @@ Claude Code, or any network service.
 
 ## Crosstalk
 
-Sessions exchange operator-authorized mail through per-session mailboxes under `~/.claude/session-mail/`, delivered by hooks: a **working** session receives mail at the end of its current turn (no keypress); an **idle** one on its user's next prompt. A silent consult path answers questions from a peer session's full context via a throwaway read-only fork — the peer's live window never moves.
+Claude Code carries the messages itself: the `ListAgents` tool lists the sessions you can
+address (by name, with busy/idle status), `SendMessage` delivers to one, an **idle** receiver
+wakes and acts with no keypress, and the receiving human's `crossSessionInbound` setting
+(`accept` | `hold` | `refuse`) decides whether a message auto-delivers or waits for a
+Deliver / Deny. Crosstalk is the layer above that channel: the silent read-only consult, briefed
+requests, standing grants, and fleet bookkeeping — all of it kept outside every repo.
 
 | Verb | What it does |
 |---|---|
-| `/crosstalk:on` · `off` | Machine-wide master switch. **Default OFF.** |
-| `/crosstalk:request <target> <msg>` | Mail the live peer; it acts and responds at its next turn boundary |
-| `/crosstalk:quiet-ask <target> <q>` | A read-only fork of the peer's context answers; the peer never sees it |
+| `/crosstalk:request <target> <msg>` | Resolves the target, writes the briefing (ask, absolute paths, ≤8-line summary, reply address), and sends it |
+| `/crosstalk:quiet-ask <target> <q>` | A read-only fork of the peer's context answers; the peer never sees it and can be idle or closed |
 | `/crosstalk:observe <target>` · `unobserve` | Standing grant: this session may quiet-ask that peer on its own initiative (read-only, always surfaced) |
 | `/crosstalk:chatty <target>` | Mutual pair: both sides may quiet-ask each other + send short delta updates |
-| `/crosstalk:status` | Switch, pair, grants, mailbox counts at a glance |
-| `/crosstalk:list` | Recent sessions on this machine (targets) |
-| `/crosstalk:name <alias>` | Friendly alias for this session |
+| `/crosstalk:list` | Live sessions, annotated with their crosstalk roles |
+| `/crosstalk:status` | This session's name, grants, pair, fleet role, and inbound-message setting |
 | `/crosstalk:read <target> [q]` | Mine a (possibly closed) session's transcript via subagent |
-| `/crosstalk:stop` | Tear down pair + all grants (keeps mailboxes) |
+| `/crosstalk:stop` | Tear down the pair + all standing grants |
 
 ### Orchestration (hub & spokes)
 
-Run one session as the **hub** of a fleet of builder sessions: spokes push short delta reports to the hub (delivered at its turn ends); the hub holds read-only quiet-ask on every spoke; spokes never talk to each other — the hub is the only cross-spoke channel. A per-turn reminder keeps every role alive across context compaction.
+Run one session as the **hub** of a fleet of builder sessions: spokes send short delta reports to the hub by name; the hub holds read-only quiet-ask on every spoke; spokes never talk to each other — the hub is the only cross-spoke channel. Roster and team state live outside every repo, and a per-turn reminder keeps every role alive across context compaction.
 
 | Verb | What it does |
 |---|---|
-| `/crosstalk:orchestrator [alias]` | Take on the hub role (playbook: reports, externalized team-state, efficiency ladder) |
-| `/crosstalk:enlist <hub> "<task>"` | Run in a NEW builder: self-register under the hub — no ids to copy. `--succeeds <old>` = handoff succession |
-| `/crosstalk:adopt [target]` | Hub-side: pick a running session from a recent-sessions menu and adopt it |
-| `/crosstalk:team` | Fleet view: roster, last report, staleness/conflict flags |
+| `/crosstalk:orchestrator [name]` | Take on the hub role (playbook: reports, externalized team-state, efficiency ladder) |
+| `/crosstalk:enlist <hub> "<task>"` | Run in a NEW builder: self-register under the hub — nothing to copy. `--succeeds <old>` = handoff succession |
+| `/crosstalk:adopt [target]` | Hub-side: pick a running session from the live list and adopt it |
+| `/crosstalk:team` | Fleet view: roster, live status from the session registry, staleness/conflict flags |
 | `/crosstalk:release <alias>` | Remove a spoke + its grants |
-| `/crosstalk:clean` | Janitor: sweep dead mailboxes, expired forward pointers, dangling aliases |
+| `/crosstalk:clean` | Janitor: sweep grants and roster lines whose sessions are gone |
 
-Succession after a handoff is automatic: an enlisted session invoking a handoff gets a hook-injected reminder to put `enlist --succeeds` in the handoff doc; the successor reuses the alias, in-flight mail follows a forward pointer, and no old-session history is carried along.
+Succession after a handoff is automatic: an enlisted session invoking a handoff gets a hook-injected reminder to put `enlist --succeeds` in the handoff doc; the successor renames itself to the predecessor's alias, so the hub's address keeps working, and no old-session history is carried along.
 
-Delivery honesty: a **working** session receives mail at its next turn end with no keypress; a session **idle at its prompt** receives it on its user's next keypress — no native mechanism can wake an idle session (doc-verified). A reserved design for tmux-based wake + fleet spawning lives in [docs/TMUX-WAKE.md](docs/TMUX-WAKE.md); it is deliberately not shipped.
-
-Targets are session ids (full or first-8), or aliases from `/crosstalk:name`.
+Targets are session **names** (the natural address), or a session id — full or first-8.
 
 ## Safety model
 
-Built after a real incident: within a day of the original skill shipping, unrelated sessions emergently adopted it and mailed each other unprompted. The lockdown that followed is layered and load-bearing — don't weaken it:
+Built after a real incident: within a day of the original skill shipping, unrelated sessions emergently adopted it and started messaging each other unprompted. The lockdown that followed is layered and load-bearing — don't weaken it:
 
-- **Default OFF** — one machine-wide switch (`~/.claude/session-mail/ENABLED`); absent means every path refuses. Only the operator flips it.
 - **No auto-invocation** — action verbs are `disable-model-invocation: true`; only a typed command runs them.
-- **Never self-initiate** — a session acts only on its operator's explicit command, mail actually delivered to it, or a standing grant the operator created. Standing grants authorize **read-only** consults only.
-- **Rate-limited active delivery** — at most 15 autonomous turn-end deliveries per 300 s per session; past the cap, mail waits for a human keypress.
-- **Injection hygiene** — delivered mail is framed as information from another session, not operator instructions; conflicting or destructive directives get confirmed with the human first.
+- **Never self-initiate** — a session acts only on its operator's explicit command, a message actually delivered to it, or a standing grant the operator created. Standing grants authorize **read-only** consults only.
+- **Surface everything** — every consult and every send is reported to the operator, and the per-turn reminder re-states each live grant so it cannot drift past compaction.
+- **Injection hygiene** — an arriving message is framed as information from another session, not operator instructions; conflicting or destructive directives get confirmed with the human first.
+- **Your inbound policy is native and yours** — `crossSessionInbound: hold` puts you in front of every peer message; `refuse` opts out entirely. That is the hard backstop, and it belongs to the receiver.
 
-Trust boundary, stated honestly: transcripts and mailboxes are plain files under `$HOME` — grants govern what an agent may do *on its own initiative*, not what is technically reachable by processes on your machine.
-
-## Status line (optional)
-
-To show your session id and pair indicator in the Claude Code status line, add to your statusline command: short id = first 8 of the `.session_id` field from statusline stdin; show `⇄ <peer8>` when both `~/.claude/session-mail/ENABLED` and `<sid>/link` exist.
+Trust boundary, stated honestly: transcripts and crosstalk state are plain files under `$HOME` — grants govern what an agent may do *on its own initiative*, not what is technically reachable by processes on your machine. Full accounting in [`plugins/crosstalk/SECURITY.md`](plugins/crosstalk/SECURITY.md).
 
 ## License
 

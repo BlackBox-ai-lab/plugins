@@ -1,23 +1,53 @@
 # Crosstalk
 
-Session-to-session messaging for Claude Code: full sessions on one machine that can message
-each other, silently consult each other's context, and self-organize into an orchestrator +
-builder fleet. **Default OFF; every action operator-gated.**
+Claude Code can now message its own sessions. Crosstalk 2.0 is the layer on top: the silent
+read-only consult of a peer's context, briefed requests instead of one-liners, operator-armed
+standing grants, and hub-and-spoke fleet bookkeeping. **Every action verb runs only on your
+explicit command.**
+
+**Requires Claude Code 2.1.224 or newer** (native `ListAgents` / `SendMessage`) and `jq` on PATH.
+
+## What the harness already gives you
+
+Cross-session messaging is native. Sessions on one machine — plus cloud and Remote Control
+sessions — discover each other by name, and a message delivered to an **idle** session wakes it:
+it reads the message and acts, with nobody at the keyboard. Delivery is consent-gated by
+permission mode, and the receiving human decides the policy. None of that is crosstalk's code,
+and none of it needs this plugin.
+
+| Capability | How it works natively |
+|---|---|
+| **Discover** | The `ListAgents` tool lists addressable sessions as `name [ref]`, with busy/idle status |
+| **Send** | The `SendMessage` tool: `{"to": "<name>", "message": "…"}` — add ` [ref]` only to disambiguate |
+| **Wake an idle peer** | An idle receiver wakes on delivery and processes the message; no keypress |
+| **Consent gate** | Auto-delivers within the same permission-mode class; otherwise the receiver's human sees *Deliver / Deny*. Set `crossSessionInbound` to `accept`, `hold`, or `refuse` in settings (a project or managed policy may only tighten it) |
+| **Names** | `claude --name <n>` at launch, `/rename <n>` in-session, or derived from the cwd |
+
+## What crosstalk adds
+
+| Verb | What it does |
+|---|---|
+| `/crosstalk:request <target> <msg>` | Resolves the target, **writes the briefing** (the ask, absolute paths, a ≤8-line summary on top, a reply address), sends it, and tells you what went out |
+| `/crosstalk:quiet-ask <target> <q>` | A throwaway read-only fork of the peer's context answers. The peer never sees it, does nothing, and can be **idle or closed** |
+| `/crosstalk:read <target> [q]` | Mines a session's transcript via a cheap subagent — closed sessions included |
+| `/crosstalk:observe <target>` · `unobserve` | Standing grant: this session may quiet-ask that peer **on its own initiative** — read-only, always surfaced |
+| `/crosstalk:chatty <target>` | Mutual pair: both sides may quiet-ask each other and send short delta updates |
+| `/crosstalk:orchestrator` · `enlist` · `adopt` · `team` · `release` | Hub-and-spoke fleets: roster, externalized team state, succession across handoffs |
+| `/crosstalk:list` · `status` · `stop` · `clean` | Live sessions annotated with their crosstalk roles · this session's state · teardown · janitor |
+
+The through-line: native messaging is a *channel*. Crosstalk is the **protocol** — who may talk
+to whom on their own initiative, what a message should contain, how to ask a question without
+disturbing anybody, and how a fleet keeps its bookkeeping outside every repo.
 
 ## Install
-
-**Prerequisites:** a recent Claude Code (run `claude --version`; if `/plugin` is an
-unknown command, update first) and `jq` on PATH (`brew install jq` / `apt install jq`). Scope: sessions
-on one machine — any project, any worktree. No API key, no network service, no account
-beyond the one already running Claude Code.
 
 ```
 /plugin marketplace add BlackBox-ai-lab/plugins
 /plugin install crosstalk@blackbox-ai-labs
 ```
 
-Prefer to read the code first, or track a fork? Clone and install from the working
-copy instead — same result:
+Prefer to read the code first, or track a fork? Clone and install from the working copy instead —
+same result:
 
 ```
 git clone https://github.com/BlackBox-ai-lab/plugins.git blackbox-plugins
@@ -25,8 +55,8 @@ git clone https://github.com/BlackBox-ai-lab/plugins.git blackbox-plugins
 /plugin install crosstalk@blackbox-ai-labs
 ```
 
-Working from a private fork, or added as a collaborator on a private repo? The SSH
-source form is supported and uses your existing git credentials:
+Working from a private fork, or added as a collaborator on a private repo? The SSH source form is
+supported and uses your existing git credentials:
 
 ```
 /plugin marketplace add git@github.com:BlackBox-ai-lab/plugins.git
@@ -35,37 +65,28 @@ source form is supported and uses your existing git credentials:
 Both work as plain CLI too, without the leading slash (`claude plugin marketplace add …`,
 `claude plugin install …`), if you'd rather script it.
 
-**Then run `/reload-plugins`** — that activates it in your current session, so you can
-keep going without restarting. The 18 verbs load as `/crosstalk:*`; the two hooks that
-deliver mail (`UserPromptSubmit`, `Stop`) are registered automatically by the install —
-there is nothing to wire by hand and nothing to add to your settings. Confirm with
-`claude plugin details crosstalk@blackbox-ai-labs`, which should report 18 skills and
-2 hooks.
+**Then run `/reload-plugins`** — that activates it in your current session, so you can keep going
+without restarting. The 15 verbs load as `/crosstalk:*`, and one `UserPromptSubmit` hook is
+registered automatically; there is nothing to wire by hand and nothing to add to your settings.
+Confirm with `claude plugin details crosstalk@blackbox-ai-labs`, which should report **15 skills
+and 1 hook**.
 
 ### First run
 
-Crosstalk is **OFF until you turn it on** — that is the top of the safety model, not a
-setup step to skip past. Nothing delivers, and every verb refuses, until the master
-switch exists:
+Nothing to switch on: the channel is the harness's, and crosstalk's own verbs each wait for your
+command.
 
 ```
-/crosstalk:on          # machine-wide switch (~/.claude/session-mail/ENABLED)
-/crosstalk:status      # switch, this session's id, pair, grants, mailbox counts
-/crosstalk:list        # recent sessions on this machine — your available targets
+/crosstalk:list                          # who is addressable, and what they are to you
+/crosstalk:quiet-ask <name> what's the state of the migration?
+/crosstalk:request  <name> take the failing test in <abs-path> and fix it
 ```
 
-Then, from one session, address another by its short id (first 8 characters) or an
-alias you set with `/crosstalk:name`:
+Watch the difference. `quiet-ask` returns an answer and the peer's window never moves.
+`request` lands in the peer's context — if it is idle it **wakes up** and gets to work; if its
+permission mode differs from yours, its human is asked to Deliver or Deny first.
 
-```
-/crosstalk:request <target> what are you working on right now?
-```
-
-Watch the target session: it answers at the end of its current turn, with no keypress
-from you. That one exchange is the whole mechanism — everything else stacks on it.
-
-To take it back down: `/crosstalk:stop` (this session's pair and grants) or
-`/crosstalk:off` (the machine-wide switch).
+To take grants back down: `/crosstalk:stop` (this session's pair and standing grants).
 
 ### Upgrading
 
@@ -76,28 +97,35 @@ claude plugin marketplace update blackbox-ai-labs
 claude plugin update crosstalk@blackbox-ai-labs
 ```
 
-## What it does
+## Upgrading from 1.x
 
-| Verb | What it does |
-|---|---|
-| `/crosstalk:on` · `off` | Machine-wide master switch. **Default OFF.** |
-| `/crosstalk:request <target> <msg>` | Mail a live peer; it acts and replies at its next turn boundary |
-| `/crosstalk:quiet-ask <target> <q>` | A read-only fork of the peer's context answers; the peer never sees it |
-| `/crosstalk:observe <target>` · `unobserve` | Standing grant: consult a peer on your own initiative (read-only, surfaced) |
-| `/crosstalk:chatty <target>` | Mutual pair: both may quiet-ask + send short updates |
-| `/crosstalk:orchestrator` · `enlist` · `adopt` · `team` · `release` | Hub-and-spoke fleets (spokes self-register and report up) |
-| `/crosstalk:status` · `list` · `name` · `read` · `stop` · `clean` | State, targets, aliases, transcript mining, teardown, janitor |
+1.x carried its own mail transport. The harness does that now, so the transport is gone.
 
-Full command reference, safety model, and design are in the
-[repository README](https://github.com/BlackBox-ai-lab/plugins) and
-[`SECURITY.md`](./SECURITY.md).
+- **Hooks changed.** 1.x registered `UserPromptSubmit` **and** `Stop`; 2.0 registers one
+  `UserPromptSubmit` hook (the role/grant reminder). Restart or `/reload-plugins` after
+  updating, or the old Stop hook stays live in the session.
+- **Run `/crosstalk:clean`.** It offers to remove the legacy `~/.claude/session-mail/` directory —
+  mailboxes, the `ENABLED` switch, `names.json` — after asking. 2.0's state lives in
+  `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/crosstalk/` and nothing is read from the old path.
+- **`on` / `off` / `name` are gone.** The master switch is replaced by the harness's
+  `crossSessionInbound` setting (`accept` | `hold` | `refuse`) — you now control what reaches
+  *you* rather than what the machine may send. Aliases are replaced by native names: `/rename <n>`,
+  or `claude --name <n>` at launch.
+- **Targets are names now.** A short id or full UUID still resolves, but the natural address is
+  the session's name.
+- **Rate limiting is gone** with the transport it bounded, and there is no `forward` pointer:
+  succession works by the successor renaming itself to the predecessor's alias.
 
 ## Safety
 
-Built after a real incident (unrelated sessions emergently mailed each other unprompted).
-Layered lockdown: default-OFF master switch, no model auto-invocation of action verbs, never
-self-initiate (standing grants are read-only only), and a rolling-window rate limit on
-autonomous delivery. No network, no credentials, no privilege escalation — see `SECURITY.md`.
+Crosstalk introduces no network surface, no credentials, and no privilege escalation. Its
+residual surface is the read-only consult fork, the flow of context between sessions, standing
+grants, cleartext state at rest, and one hook — each covered candidly in
+[`SECURITY.md`](./SECURITY.md). The agency rules are the plugin's identity and are not decorative:
+action verbs are `disable-model-invocation: true`, a session never self-initiates a message, and
+the only sanctioned self-initiation is a **read-only** consult of a peer you explicitly drew in.
+
+Full mechanics: [`references/protocol.md`](./references/protocol.md).
 
 ## License
 

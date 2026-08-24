@@ -9,15 +9,24 @@ disable-model-invocation: true
 
 ## Gate & agency (non-negotiable)
 
-1. If `~/.claude/session-mail/ENABLED` is absent: refuse, point at `/crosstalk:on`, do nothing else.
-2. Only the operator's explicit command authorizes reading another session's transcript — never your own curiosity.
-3. Surface what you learned. Mechanics: `${CLAUDE_PLUGIN_ROOT}/references/protocol.md`.
+1. Only the operator's explicit command authorizes reading another session's transcript — never
+   your own curiosity.
+2. Surface what you learned. Mechanics: `${CLAUDE_PLUGIN_ROOT}/references/protocol.md`.
 
 ## Procedure
 
-1. Locate: `ls ~/.claude/projects/*/<id>*.jsonl` (short ids and aliases resolve per the protocol).
-2. Transcripts are huge JSONL — do NOT read the whole file into context. Spawn a subagent (Explore or general-purpose; a cheap model is fine — this is extraction, not judgment) with the file path, the question (or "summarize: goal, current state, key decisions, open items — ≤300 words"), and this extraction hint:
+1. **Resolve the target.** `bash "${CLAUDE_PLUGIN_ROOT}/scripts/crosstalk-resolve.sh" "<target>"`
+   → `sessionId  cwd  name  status`; closed sessions resolve too. Then locate the transcript:
+   `ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/<sessionId>*.jsonl`.
+2. Transcripts are huge JSONL — do NOT read the whole file into context. Spawn a subagent
+   (Explore or general-purpose; a cheap model is fine — this is extraction, not judgment) with
+   the file path, the question (or "summarize: goal, current state, key decisions, open items —
+   ≤300 words"), and this extraction hint:
    ```
    jq -r 'select(.type=="user" or .type=="assistant") | .message.content | if type=="array" then .[] | select(.type=="text") | .text else . end' <file>
    ```
 3. Present the distilled answer and fold it into your working context.
+
+Reading a transcript tells you what a session *did*. When you need its *judgment* instead, use
+`/crosstalk:quiet-ask` — same silence, but the peer's context actually reasons about your
+question.

@@ -10,9 +10,9 @@
     {
       "name": "crosstalk",
       "source": "./plugins/crosstalk",
-      "description": "Session-to-session messaging and read-only consult between live Claude Code sessions on one machine. Default OFF, operator-gated.",
+      "description": "Discipline and depth on top of Claude Code's native cross-session messaging: silent read-only consults of a peer session's context (idle or closed), briefed requests, operator-armed standing grants, and hub-and-spoke fleet bookkeeping. Every action verb operator-gated.",
       "category": "workflow",
-      "version": "1.3.1",
+      "version": "2.0.0",
       "author": {
         "name": "Blackbox AI Labs",
         "email": "blackboxailabs@gmail.com"
@@ -24,7 +24,7 @@
     {
       "name": "session-atlas",
       "source": "./plugins/session-atlas",
-      "description": "The standing map of every Claude Code session on a machine: living HTML pages (search, gists, resume commands) plus an agent-safe find/resolve/import CLI. Multi-account aware, stdlib-only, no credentials \u2014 gists are written by your own session's model.",
+      "description": "The standing map of every Claude Code session on a machine: living HTML pages (search, gists, resume commands) plus an agent-safe find/resolve/import CLI. Multi-account aware, stdlib-only, no credentials — gists are written by your own session's model.",
       "category": "workflow",
       "version": "1.1.1",
       "author": {

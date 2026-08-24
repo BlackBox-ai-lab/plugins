@@ -1,8 +1,8 @@
 {
   "name": "crosstalk",
   "displayName": "Crosstalk",
-  "version": "1.3.1",
-  "description": "Session-to-session messaging for Claude Code: mailbox requests delivered at turn end, silent read-only consults of peer sessions, and operator-granted standing consult. Default OFF; every action operator-gated.",
+  "version": "2.0.0",
+  "description": "Discipline and depth on top of Claude Code's native cross-session messaging: silent read-only consults of a peer's context (idle or closed), briefed requests, operator-armed standing grants, and hub-and-spoke fleet bookkeeping. Every action verb is operator-gated.",
   "author": {
     "name": "Blackbox AI Labs"
   },
