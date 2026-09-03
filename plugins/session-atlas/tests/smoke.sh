@@ -70,4 +70,46 @@ assert 'bogus-sid-not-queued' not in c, 'unqueued sid must be rejected'
 python3 "$ENGINE" >/dev/null
 grep -q "Smoke-test gist line." "$TMP/home/.cache/session-atlas/html/session-ladder.html"
 
+# ai-title: a session the operator never renamed wears the title Claude
+# generated, not its opening prompt — and the LAST such record wins, because
+# the title is rewritten as a session evolves.
+TITLED="cccccccc-dddd-eeee-ffff-000000000000"
+{ printf '{"type":"user","cwd":"/data/fixture-repo","timestamp":"2026-07-22T11:00:00Z","message":{"content":"open question about widgets"}}\n'
+  printf '{"type":"ai-title","aiTitle":"First guess at a title"}\n'
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"answering about widgets"}]}}\n'
+  printf '{"type":"ai-title","aiTitle":"Widget subsystem rewrite"}\n'
+  for i in $(seq 40); do
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"padding line %d to clear the small-file filter ................................"}]}}\n' "$i"
+  done
+} > "$PROJ/$TITLED.jsonl"
+
+python3 "$ENGINE" >/dev/null
+for PAGE in session-ladder session-atlas; do
+  P="$TMP/home/.cache/session-atlas/html/$PAGE.html"
+  if ! grep -q "Widget subsystem rewrite" "$P"; then
+    echo "FAIL: $PAGE lacks the ai-title"; exit 1
+  fi
+  if grep -q "First guess at a title" "$P"; then
+    echo "FAIL: $PAGE shows a superseded ai-title"; exit 1
+  fi
+done
+# the opening prompt is not lost — it moves off the title line, not off the page
+grep -q "open question about widgets" "$TMP/home/.cache/session-atlas/html/session-atlas.html"
+
+# the title is searchable, and carries the topic line of --find / --resolve
+python3 "$ENGINE" --find "widget subsystem" | grep -q "claude --resume $TITLED"
+python3 "$ENGINE" --resolve cccccccc | grep -q "Widget subsystem rewrite"
+
+# an operator rename still outranks the generated title: `name` means "the
+# operator named this", and ai-title must never be folded into it
+RENAMED="dddddddd-eeee-ffff-0000-111111111111"
+{ printf '{"type":"user","cwd":"/data/fixture-repo","timestamp":"2026-07-22T12:00:00Z","message":{"content":"third fixture session"}}\n'
+  printf '{"type":"ai-title","aiTitle":"Generated title loses"}\n'
+  printf '{"type":"custom-title","customTitle":"Operator rename wins"}\n'
+  for i in $(seq 40); do
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"padding line %d to clear the small-file filter ................................"}]}}\n' "$i"
+  done
+} > "$PROJ/$RENAMED.jsonl"
+python3 "$ENGINE" --resolve dddddddd | grep -q "Operator rename wins"
+
 echo "smoke ok"

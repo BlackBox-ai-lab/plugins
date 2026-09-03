@@ -105,9 +105,10 @@ def _text(content):
 
 
 def scan(path, max_lines=4000):
-    """Cheap single pass: cwd, session name, first real user msg, last
-    summary, and the session's start timestamp (first record's ISO ts)."""
-    cwd = name = first_user = last_summary = started = None
+    """Cheap single pass: cwd, session name, the title Claude generated, first
+    real user msg, last summary, and the session's start timestamp (first
+    record's ISO ts)."""
+    cwd = name = ai_title = first_user = last_summary = started = None
     try:
         with open(path, errors="replace") as fh:
             for i, ln in enumerate(fh):
@@ -129,6 +130,12 @@ def scan(path, max_lines=4000):
                     name = rec["customTitle"]
                 elif rec.get("type") == "agent-name" and rec.get("agentName"):
                     name = rec["agentName"]
+                # the title Claude generates and DISPLAYS. Deliberately NOT
+                # folded into `name`, which means "the operator named this" —
+                # other logic keys on that distinction. Last write wins: the
+                # title is rewritten as a session evolves.
+                elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
+                    ai_title = rec["aiTitle"]
                 m = rec.get("message") or {}
                 if rec.get("type") == "user" and first_user is None:
                     t = _text(m.get("content")).strip()
@@ -142,13 +149,14 @@ def scan(path, max_lines=4000):
                         name = s[j + 18:].split(".")[0].strip().strip(' "“”')
     except Exception:
         pass
-    return cwd, name, first_user, last_summary, started
+    return cwd, name, ai_title, first_user, last_summary, started
 
 
 def tail_records(path, tail_bytes=262144, keep=24):
     """Bounded read of a transcript's TAIL: the last meaningful user/assistant
-    texts (oldest→newest) + any late rename. Never reads the whole file."""
-    texts, late_name = [], None
+    texts (oldest→newest) + any late rename or retitle. Never reads the whole
+    file."""
+    texts, late_name, late_title = [], None, None
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -163,6 +171,10 @@ def tail_records(path, tail_bytes=262144, keep=24):
                 continue
             if rec.get("type") == "custom-title" and rec.get("customTitle"):
                 late_name = rec["customTitle"]
+            elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
+                # a long session's title is rewritten as it goes, so the tail
+                # holds the current one — the head only holds the first guess
+                late_title = rec["aiTitle"]
             m = rec.get("message") or {}
             t = None
             if rec.get("type") == "user" and not rec.get("isMeta"):
@@ -177,7 +189,7 @@ def tail_records(path, tail_bytes=262144, keep=24):
                 texts.append(t[:1500])
     except Exception:
         pass
-    return texts[-keep:], late_name
+    return texts[-keep:], late_name, late_title
 
 
 def _needs_gist(rows, cache):
@@ -205,7 +217,7 @@ def gist_queue(rows, limit):
     for r in _needs_gist(rows, cache):
         if len(items) >= limit:
             break
-        texts, _late = tail_records(r["path"])
+        texts, _late, _title = tail_records(r["path"])
         tail = "\n\n".join(texts)[-GIST_TAIL_CHARS:].strip()
         if not tail:
             # nothing summarizable (aborted/meta-only session). Skipping keeps it
@@ -213,7 +225,7 @@ def gist_queue(rows, limit):
             # forever, since a session with no gist always "needs" one.
             continue
         items.append({"sid": r["sid"], "repo": r["repo"],
-                      "title": (r["name"] or r["first"] or "")[:80],
+                      "title": (r["name"] or r["ai_title"] or r["first"] or "")[:80],
                       "mtime": int(r["mtime"]),
                       "tail": tail})
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -293,9 +305,11 @@ def build_deep_index(rows):
             if not r["name"] and c.get("name"):
                 r["name"] = c["name"]
             continue
-        texts, late_name = tail_records(r["path"])
+        texts, late_name, late_title = tail_records(r["path"])
         if late_name and not r["name"]:
             r["name"] = late_name
+        if late_title:
+            r["ai_title"] = late_title
         words = re.findall(r"[a-z0-9][a-z0-9_.-]{2,24}", " ".join(texts).lower())
         # frequency-ranked so truncation drops rare noise, not alphabet ranges
         r["deep"] = " ".join(w for w, _ in Counter(words).most_common(300))[:2500]
@@ -337,7 +351,7 @@ def collect(days, cap):
     rows.sort(reverse=True)
     out = []
     for mt, label, launcher, f in rows[:cap]:
-        cwd, name, first, summ, started = scan(f)
+        cwd, name, ai_title, first, summ, started = scan(f)
         if not cwd:
             continue
         start = None
@@ -354,6 +368,7 @@ def collect(days, cap):
         out.append(dict(mtime=mt, start=start, acct=label, launcher=launcher,
                         sid=os.path.basename(f)[:-6], path=f,
                         repo=repo, cwd=cwd, name=name, gist="",
+                        ai_title=(ai_title or "")[:200],
                         first=(first or "")[:200], summary=(summ or "")[:280]))
     return out
 
@@ -421,15 +436,19 @@ Updated {time.strftime('%Y-%m-%d %H:%M %Z')}.</div></div></header><div class="wr
                      f'<span class="ago">last active {ago}</span>{_heat(rs)}</h2>')
         for r in rs:
             when = time.strftime("%a %m-%d %H:%M", time.localtime(r["mtime"]))
-            # unnamed sessions wear their first prompt as the title — an
-            # empty "(unnamed)" marker tells the operator nothing
+            # a session the operator never renamed still HAS a title on screen:
+            # the one Claude generated. It wears that, falling back to its first
+            # prompt — an empty "(unnamed)" marker tells the operator nothing
             if r["name"]:
                 nm = f'<span class="nm">{e(r["name"])}</span>'
-                topic = r.get("gist") or r["summary"] or r["first"]
+                topic = r.get("gist") or r["ai_title"] or r["summary"] or r["first"]
             else:
+                head = r["ai_title"] or r["first"] or r["summary"] or "(empty session)"
                 nm = ('<span class="nm" style="font-weight:500">'
-                      f'{e((r["first"] or r["summary"] or "(empty session)")[:110])}</span>')
-                topic = r.get("gist") or r["summary"] or ""
+                      f'{e(head[:110])}</span>')
+                # when the title took the head, the opening prompt drops here
+                topic = (r.get("gist") or r["summary"]
+                         or (r["first"] if r["ai_title"] else ""))
             badge = '<span class="live">● running</span>' if r["sid"] in live else ""
             parts.append(
                 f'<div class="s"><span class="when">{when}</span> {nm}'
@@ -512,9 +531,9 @@ def _pill(r, color, tfmt, live={}, ops=False):
     c = color.get(repo, TL_OTHER)
     other = "" if repo in color else ' data-o="1"'
     hh = time.strftime(tfmt, time.localtime(r["mtime"]))
-    head = name or (first or r["summary"] or "(empty session)")[:90]
+    head = name or (r["ai_title"] or first or r["summary"] or "(empty session)")[:90]
     hl_cls = "hl" if name else "hl un"
-    hay = e(" ".join([repo, name, first, r["summary"],
+    hay = e(" ".join([repo, name, r["ai_title"], first, r["summary"],
                       r.get("gist") or "", r.get("deep") or ""]).lower())
     gist = r.get("gist") or r["summary"]
     detail = []
@@ -840,8 +859,8 @@ def _score(rows, query):
     for r in rows:
         if r["sid"] == me:
             continue
-        head = " ".join([r["repo"], r["name"] or "", r["first"], r["summary"],
-                         r.get("gist") or ""]).lower()
+        head = " ".join([r["repo"], r["name"] or "", r["ai_title"], r["first"],
+                         r["summary"], r.get("gist") or ""]).lower()
         deep = r.get("deep") or ""
         matched = sum(1 for w in terms if w in head or w in deep)
         if not matched:
@@ -863,7 +882,7 @@ def find(rows, query, limit=8):
     live = live_status()
     for r in hits[:limit]:
         when = time.strftime("%m-%d %H:%M", time.localtime(r["mtime"]))
-        topic = (r["name"] or r["summary"] or r["first"])[:110]
+        topic = (r["name"] or r["ai_title"] or r["summary"] or r["first"])[:110]
         badge = "  ● running" if r["sid"] in live else ""
         print(f"{when}  [{r['repo']}] ({r['acct']}){badge}  {topic}")
         print(f"        cd {r['cwd']} && {r['launcher']} --resume {r['sid']}")
@@ -880,7 +899,8 @@ def resolve(rows, query, limit=5):
         hits = _score(rows, query)
     live = live_status()
     for r in hits[:limit]:
-        topic = re.sub(r"\s+", " ", (r["name"] or r["summary"] or r["first"]))[:80]
+        topic = re.sub(r"\s+", " ",
+                       (r["name"] or r["ai_title"] or r["summary"] or r["first"]))[:80]
         print("\t".join([
             r["sid"], r["acct"], r["launcher"], r["cwd"],
             "running" if r["sid"] in live else "-",

@@ -102,6 +102,22 @@ still works: scans `~/.claude/projects`, writes pages under
 - **Atlas** (secondary): the same scan grouped by project with per-repo
   activity heatstrips.
 
+## How a session gets its title
+
+Sessions are listed under the best name available, in this order:
+
+1. **Your rename** — `/rename`, or a name you gave a subagent. If you named it,
+   nothing overrides that.
+2. **The title Claude generated** — the one shown on screen while the session
+   runs, read straight from the transcript. It costs nothing to read and is
+   rewritten as the work evolves, so the newest one wins.
+3. **The opening prompt** — the last resort, and often the least useful, because
+   a session that opens by reading a handoff or loading a skill starts with
+   boilerplate that says nothing about what it became.
+
+The "where we left off" gist is separate: a title says what a session is *about*,
+a gist says where it *stands*, so cards show both when a gist exists.
+
 ## Design rules
 
 - **No credentials, ever.** The engine makes no network calls of its own. Gists
