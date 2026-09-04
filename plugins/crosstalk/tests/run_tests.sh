@@ -54,6 +54,33 @@ ck "name: cwd returned"  test "$(cut -f2 <<<"$out")" = "/home/x/alpha"
 ck "name: name returned" test "$(cut -f3 <<<"$out")" = "alpha-builder"
 ck "name: status busy"   test "$(cut -f4 <<<"$out")" = "busy"
 
+echo "== 1b. resolver: name matching is case-insensitive =="
+# A session name is an ADDRESS and people dictate addresses with capitals. Before
+# this, "Alpha-Builder" reported the session as NONEXISTENT rather than as a
+# capitalisation difference -- a false negative that reads like "it is gone".
+for variant in "Alpha-Builder" "ALPHA-BUILDER" "alpha-BUILDER"; do
+  out=$(run bash "$SCRIPTS/crosstalk-resolve.sh" "$variant" 2>/dev/null); rc=$?
+  ck "ci '$variant': exit 0"       test "$rc" -eq 0
+  ck "ci '$variant': sid returned" test "$(cut -f1 <<<"$out")" = "$SID_A"
+done
+
+# An EXACT match must still win, so case-folding can never change which session an
+# exactly-typed name resolves to. Two sessions differing only by case: each exact
+# spelling must return its own session, not the other and not an ambiguity error.
+SID_CASE="ffff1111-2222-3333-4444-555555555555"
+reg casey "$$" "$SID_CASE" "/home/x/casey" "Alpha-Builder" "idle"
+out=$(run bash "$SCRIPTS/crosstalk-resolve.sh" alpha-builder 2>/dev/null); rc=$?
+ck "exact wins (lower): exit 0" test "$rc" -eq 0
+ck "exact wins (lower): sid"    test "$(cut -f1 <<<"$out")" = "$SID_A"
+out=$(run bash "$SCRIPTS/crosstalk-resolve.sh" "Alpha-Builder" 2>/dev/null); rc=$?
+ck "exact wins (mixed): exit 0" test "$rc" -eq 0
+ck "exact wins (mixed): sid"    test "$(cut -f1 <<<"$out")" = "$SID_CASE"
+# a spelling matching NEITHER exactly is ambiguous across the two -> exit 1
+err=$(run bash "$SCRIPTS/crosstalk-resolve.sh" "ALPHA-BUILDER" 2>&1 >/dev/null); rc=$?
+ck "ci ambiguous: exit 1"       test "$rc" -eq 1
+ck "ci ambiguous: lists both"   grep -q "ambiguous" <<<"$err"
+rm -f "$CFG/sessions/casey.json"   # keep later sections' fixtures unchanged
+
 echo "== 2. resolver: 8-char short id and full uuid =="
 out=$(run bash "$SCRIPTS/crosstalk-resolve.sh" bbbb1111 2>/dev/null); rc=$?
 ck "short id: exit 0"     test "$rc" -eq 0

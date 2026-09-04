@@ -35,8 +35,19 @@ fi
 
 alive() { [ -d "/proc/$1" ] || kill -0 "$1" 2>/dev/null; }
 
+# Resolution is case-insensitive. A session name is an ADDRESS, and people type
+# and dictate addresses with capitals -- "Checking Switch Skill" must reach the
+# session named "checking switch skill" rather than be reported as nonexistent.
+# An exact match still wins, so case-folding can never change which session an
+# exactly-typed name resolves to; it only adds a fallback.
+# `tr` rather than ${x,,} on purpose: this plugin is public and bash 3.2 (the
+# system bash on macOS) has no case conversion.
+lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+TARGET_LC=$(lower "$TARGET")
+
 # --- 1. live registry -------------------------------------------------------
 name_hits=""   # newline-separated "sid\tcwd\tname\tstatus"
+ci_hits=""     # same, matched only after case-folding
 id_hits=""
 shopt -s nullglob
 for f in "$CFG"/sessions/*.json; do
@@ -48,13 +59,15 @@ for f in "$CFG"/sessions/*.json; do
   alive "$pid" || continue
   if [ "$name" = "$TARGET" ]; then
     name_hits+="${sid}"$'\t'"${cwd}"$'\t'"${name}"$'\t'"${status}"$'\n'
-  elif [ "${sid#"$TARGET"}" != "$sid" ]; then
+  elif [ "$(lower "$name")" = "$TARGET_LC" ]; then
+    ci_hits+="${sid}"$'\t'"${cwd}"$'\t'"${name}"$'\t'"${status}"$'\n'
+  elif [ "${sid#"$TARGET_LC"}" != "$sid" ]; then
     id_hits+="${sid}"$'\t'"${cwd}"$'\t'"${name}"$'\t'"${status}"$'\n'
   fi
 done
 
 pick=""
-for bucket in "$name_hits" "$id_hits"; do
+for bucket in "$name_hits" "$ci_hits" "$id_hits"; do
   [ -z "$bucket" ] && continue
   n=$(printf '%s' "$bucket" | grep -c '')
   if [ "$n" -eq 1 ]; then
@@ -72,7 +85,7 @@ done
 # --- 2. transcript fallback (closed sessions) -------------------------------
 if [ -z "$pick" ]; then
   thits=""
-  for t in "$CFG"/projects/*/"$TARGET"*.jsonl; do
+  for t in "$CFG"/projects/*/"$TARGET_LC"*.jsonl; do   # session ids are lowercase hex
     [ -f "$t" ] || continue
     base=$(basename "$t" .jsonl)
     cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$t" 2>/dev/null | cut -d'"' -f4)
