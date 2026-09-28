@@ -13,8 +13,11 @@ into context**; interact only through the commands below.
    ```
    ${CLAUDE_PLUGIN_ROOT}/scripts/session-atlas --find "<a few keywords>"
    ```
-   Sessions matching **all** terms rank first; the index covers titles, first
-   prompts, gists, and (for recent sessions) words from the transcript tail.
+   Sessions matching **all** terms rank first; the index covers every session
+   of every configured account: titles, first prompts, the operator's prompts,
+   gists, and words from the start and end of each transcript. The first call on
+   a machine builds the index once (it says so on stderr and can take minutes);
+   later calls answer in under a second.
    Each hit prints `date [repo] (account) [● running]  topic` plus a
    `cd <dir> && <launcher> --resume <sid>` line.
 2. Relay the best 1–3 hits **verbatim** (keep the `● running` flag — resuming a

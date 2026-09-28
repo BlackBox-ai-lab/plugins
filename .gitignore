@@ -5,3 +5,4 @@ scratch_archive/
 scripts/.leak-patterns.local
 
 scripts/.leak-allow.local
+__pycache__/

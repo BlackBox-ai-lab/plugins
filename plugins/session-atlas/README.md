@@ -125,10 +125,14 @@ a gist says where it *stands*, so cards show both when a gist exists.
   bounded work-list to a subagent, `--gist-write` stores the result), so there is
   no API key, endpoint, or model id to configure — and rendering runs on the
   cache with nothing at all.
-- **Bounded reads.** Transcripts are only ever tail-read (256 KB cap) — an
-  800k-token session costs the same as a short one. Gists and the deep search
-  index are cached per (sid, mtime); the past never changes, so regenerations
-  only pay for sessions that actually changed.
+- **One index, bounded reads.** Search runs on a local SQLite full-text index
+  (`~/.cache/session-atlas/index.db`, Python's built-in `sqlite3`) that covers
+  every session of every configured account, not just recent ones. Each call
+  stats the transcripts and re-reads only those that changed, and a re-read
+  takes the first 128 KB and the last 256 KB of the file, never the middle, so
+  an 800k-token session costs the same as a short one. The first run indexes
+  everything once (a few minutes on a large history, on a spinning disk);
+  after that a lookup takes well under a second. `--reindex` rebuilds it.
 - **Agents never read the pages.** The HTML exists for the operator's browser;
   in-session lookups go through `--find`/`--resolve` (a few hundred tokens).
 - **Worktrees are invisible.** Sessions running in `.claude/worktrees/` roll up

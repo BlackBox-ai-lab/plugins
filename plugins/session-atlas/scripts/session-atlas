@@ -31,13 +31,28 @@ NO CREDENTIALS ANYWHERE. This script never calls a model. Gists are produced
 by a Claude session's own model via --gist-queue / --gist-write (see the
 refresh skill), so there is no API key, endpoint, or model id to configure.
 Rendering and publishing run on cached gists and need nothing at all.
+
+THE INDEX. Every command reads one SQLite file (stdlib sqlite3 + FTS5),
+~/.cache/session-atlas/index.db. Each call stats every transcript (cheap) and
+re-reads only those whose (size, mtime) changed since the last call, and each
+of those reads is bounded: the first HEAD_BYTES and the last TAIL_BYTES of the
+file, never the middle. So the first run pays once for every transcript on the
+machine and every later call pays only for the sessions that moved.
 """
-import calendar, glob, html, json, os, re, subprocess, sys, time
+import calendar, glob, html, json, os, re, sqlite3, subprocess, sys, time
+from collections import Counter
 
 CONFIG_PATH = os.environ.get("SESSION_ATLAS_CONFIG",
                              os.path.expanduser("~/.config/session-atlas/config.json"))
 CACHE_DIR = os.path.expanduser("~/.cache/session-atlas")
 CACHE = os.path.join(CACHE_DIR, "summaries.json")
+INDEX = os.path.join(CACHE_DIR, "index.db")
+INDEX_VERSION = 1   # bump when the schema or what a row holds changes -> rebuild
+HEAD_BYTES = 131072    # read from the start of a changed transcript
+TAIL_BYTES = 262144    # read from the end of a changed transcript
+MIN_BYTES = 2000       # smaller transcripts are aborted starts, never indexed
+BODY_CHARS = 8000      # operator prompts kept per session for search
+DEEP_WORDS = 400       # frequency-ranked words kept per session for search
 QUEUE = os.path.join(CACHE_DIR, "gist-queue.json")
 HTML_DIR = os.path.join(CACHE_DIR, "html")
 OUT = os.path.join(HTML_DIR, "session-atlas.html")
@@ -48,7 +63,7 @@ TL_COLORS = ["#2a78d6", "#1baf7a", "#eda100", "#008300",
              "#4a3aa7", "#e34948", "#e87ba4", "#eb6834"]
 TL_OTHER = "#898781"
 TL_MAX = 2000       # ladder carries every session in the window (atlas stays curated)
-TL_DEEP = 400       # newest N sessions also get transcript-TAIL words in the search index
+TL_DEEP = 400       # newest N ladder cards carry transcript words for the page's own search
 BOILER = "This session is being continued from a previous conversation"
 GIST_DAYS = 30     # gist eligibility: younger than this AND within GIST_MAX newest
 GIST_MAX = 450
@@ -104,52 +119,300 @@ def _text(content):
     return ""
 
 
-def scan(path, max_lines=4000):
-    """Cheap single pass: cwd, session name, the title Claude generated, first
-    real user msg, last summary, and the session's start timestamp (first
-    record's ISO ts)."""
-    cwd = name = ai_title = first_user = last_summary = started = None
+def _is_prompt(t):
+    """A real operator prompt, not harness boilerplate or a tool result."""
+    return bool(t) and not t.startswith("<") and "Caveat:" not in t[:40] \
+        and not t.startswith(BOILER)
+
+
+def _parse_lines(data):
+    """Facts from one window of transcript lines (oldest -> newest). Titles are
+    last-write-wins within the window; `first` is the window's first prompt."""
+    f = dict(cwd=None, started=None, name=None, ai_title=None, summary=None,
+             first=None, prompts=[], texts=[])
+    for ln in data.splitlines():
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        typ = rec.get("type")
+        if f["started"] is None and rec.get("timestamp"):
+            f["started"] = rec["timestamp"]
+        if f["cwd"] is None and rec.get("cwd"):
+            f["cwd"] = rec["cwd"]
+        if typ == "summary" and rec.get("summary"):
+            f["summary"] = rec["summary"]
+        # the harness writes structured rename records — canonical, last wins
+        if typ == "custom-title" and rec.get("customTitle"):
+            f["name"] = rec["customTitle"]
+        elif typ == "agent-name" and rec.get("agentName"):
+            f["name"] = rec["agentName"]
+        # the title Claude generates and DISPLAYS. Deliberately NOT folded
+        # into `name`, which means "the operator named this" — other logic
+        # keys on that distinction. Rewritten as a session evolves.
+        elif typ == "ai-title" and rec.get("aiTitle"):
+            f["ai_title"] = rec["aiTitle"]
+        m = rec.get("message") or {}
+        if not isinstance(m, dict):
+            m = {}
+        if typ == "user":
+            t = _text(m.get("content")).strip()
+            if _is_prompt(t):
+                if f["first"] is None:
+                    f["first"] = t
+                if not rec.get("isMeta"):
+                    f["prompts"].append(t[:1500])
+                    f["texts"].append(t[:1500])
+        elif typ == "assistant":
+            a = _text(m.get("content")).strip()
+            if a:
+                f["texts"].append(a[:1500])
+        if "named this session" in ln:
+            s = _text(m.get("content"))
+            j = s.find("named this session")
+            if j >= 0:
+                f["name"] = f["name"] or s[j + 18:].split(".")[0].strip().strip(' "“”')
+    return f
+
+
+_CWD_RE = re.compile(r'"cwd":"((?:[^"\\]|\\.)*)"')
+_TS_RE = re.compile(r'"timestamp":"([0-9T:.\-]+Z?)"')
+
+
+def read_bounded(path, size):
+    """The head and tail windows of one transcript — never the middle. A file
+    that fits in both windows is read once and serves as both."""
+    with open(path, "rb") as fh:
+        if size <= HEAD_BYTES + TAIL_BYTES:
+            data = fh.read().decode("utf-8", "replace")
+            return data, data
+        head = fh.read(HEAD_BYTES).decode("utf-8", "replace")
+        fh.seek(size - TAIL_BYTES)
+        fh.readline()  # drop the partial line at the seek point
+        tail = fh.read().decode("utf-8", "replace")
+    # a head cut mid-line leaves a partial record; _parse_lines skips it
+    return head, tail
+
+
+def scan(path, prev=None):
+    """Bounded read of one transcript -> the facts a row needs. `prev` is the
+    row stored for this path before it changed: a rename or retitle that has
+    since scrolled out of both windows is kept rather than forgotten."""
+    prev = prev or {}
     try:
-        with open(path, errors="replace") as fh:
-            for i, ln in enumerate(fh):
-                if i > max_lines and cwd and (first_user or name):
-                    break
-                try:
-                    rec = json.loads(ln)
-                except Exception:
-                    continue
-                if started is None and rec.get("timestamp"):
-                    started = rec["timestamp"]
-                if cwd is None and rec.get("cwd"):
-                    cwd = rec["cwd"]
-                if rec.get("type") == "summary" and rec.get("summary"):
-                    last_summary = rec["summary"]
-                # the harness writes structured rename records — canonical,
-                # last-write-wins (late renames are also caught by tail_records)
-                if rec.get("type") == "custom-title" and rec.get("customTitle"):
-                    name = rec["customTitle"]
-                elif rec.get("type") == "agent-name" and rec.get("agentName"):
-                    name = rec["agentName"]
-                # the title Claude generates and DISPLAYS. Deliberately NOT
-                # folded into `name`, which means "the operator named this" —
-                # other logic keys on that distinction. Last write wins: the
-                # title is rewritten as a session evolves.
-                elif rec.get("type") == "ai-title" and rec.get("aiTitle"):
-                    ai_title = rec["aiTitle"]
-                m = rec.get("message") or {}
-                if rec.get("type") == "user" and first_user is None:
-                    t = _text(m.get("content")).strip()
-                    if (t and not t.startswith("<") and "Caveat:" not in t[:40]
-                            and not t.startswith(BOILER)):
-                        first_user = t
-                if name is None and "named this session" in ln:
-                    s = _text(m.get("content"))
-                    j = s.find("named this session")
-                    if j >= 0:
-                        name = s[j + 18:].split(".")[0].strip().strip(' "“”')
-    except Exception:
+        size = os.path.getsize(path)
+        head_s, tail_s = read_bounded(path, size)
+    except OSError:
+        return None
+    whole = head_s is tail_s
+    h = _parse_lines(head_s)
+    t = h if whole else _parse_lines(tail_s)
+    cwd = h["cwd"] or t["cwd"]
+    if not cwd:  # first record longer than the head window
+        m = _CWD_RE.search(head_s)
+        cwd = json.loads('"%s"' % m.group(1)) if m else None
+    started = h["started"]
+    if not started:
+        m = _TS_RE.search(head_s)
+        started = m.group(1) if m else None
+    start = None
+    if started:
+        try:
+            start = calendar.timegm(time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            start = None
+    # tail beats what we knew beats head: the head holds only the first guess
+    name = t["name"] or prev.get("name") or h["name"]
+    ai_title = t["ai_title"] or prev.get("ai_title") or h["ai_title"]
+    summary = t["summary"] or prev.get("summary") or h["summary"]
+    prompts = h["prompts"] if whole else h["prompts"] + t["prompts"]
+    texts = h["texts"] if whole else h["texts"] + t["texts"]
+    words = re.findall(r"[a-z0-9][a-z0-9_.-]{2,24}", " ".join(texts).lower())
+    # frequency-ranked so truncation drops rare noise, not alphabet ranges
+    deep = " ".join(w for w, _ in Counter(words).most_common(DEEP_WORDS))
+    return dict(cwd=cwd, start=start, name=name or "", ai_title=(ai_title or "")[:200],
+                first=(h["first"] or t["first"] or "")[:200], summary=(summary or "")[:280],
+                body=" \n".join(prompts)[:BODY_CHARS], deep=deep)
+
+
+def _repo_of(cwd):
+    # worktree cwds (<repo>/.claude/worktrees/<x>) consolidate silently into
+    # their parent repo — worktrees are plumbing the operator never sees
+    if "/.claude/worktrees/" in cwd:
+        return os.path.basename(cwd.partition("/.claude/worktrees/")[0])
+    return os.path.basename(cwd)
+
+
+SCHEMA = """
+CREATE TABLE sessions(
+  id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, sid TEXT NOT NULL,
+  acct TEXT NOT NULL, launcher TEXT NOT NULL, size INTEGER NOT NULL,
+  mtime REAL NOT NULL, start INTEGER, cwd TEXT, repo TEXT, name TEXT,
+  ai_title TEXT, first TEXT, summary TEXT, gist TEXT NOT NULL DEFAULT '');
+CREATE INDEX sessions_sid ON sessions(sid);
+CREATE INDEX sessions_mtime ON sessions(mtime);
+CREATE VIRTUAL TABLE fts USING fts5(
+  title, repo, first, summary, gist, body, deep,
+  tokenize='porter unicode61 remove_diacritics 2');
+CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+"""
+# bm25 column weights, in fts column order: a title hit outweighs a word
+# somewhere in the transcript
+WEIGHTS = (10.0, 6.0, 3.0, 3.0, 4.0, 1.5, 1.0)
+
+
+def _prefetch(path):
+    """Read a file front to back once. A cold query touches pages scattered
+    across the index, and on a spinning disk those random reads cost far more
+    than one sequential pass; on a warm cache this costs milliseconds."""
+    try:
+        with open(path, "rb", buffering=0) as fh:
+            while fh.read(1 << 20):
+                pass
+    except OSError:
         pass
-    return cwd, name, ai_title, first_user, last_summary, started
+
+
+def _connect():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for f in (INDEX, INDEX + "-wal"):
+        _prefetch(f)
+    if not os.path.exists(INDEX):  # it holds prompt text: owner-only
+        os.close(os.open(INDEX, os.O_CREAT | os.O_WRONLY, 0o600))
+    db = sqlite3.connect(INDEX, timeout=2)
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError:
+        pass  # another process holds the write lock; reads still work
+    # the index is a rebuildable cache: skip the per-commit fsync
+    db.execute("PRAGMA synchronous=NORMAL")
+    if db.execute("PRAGMA user_version").fetchone()[0] != INDEX_VERSION:
+        db.execute("BEGIN IMMEDIATE")
+        # re-check under the lock: a concurrent first run may have just built it
+        if db.execute("PRAGMA user_version").fetchone()[0] == INDEX_VERSION:
+            db.rollback()
+            return db
+        for tbl in ("sessions", "fts", "meta"):
+            db.execute("DROP TABLE IF EXISTS %s" % tbl)
+        db.executescript(SCHEMA)  # executescript COMMITs first; fine here
+        db.execute("PRAGMA user_version=%d" % INDEX_VERSION)
+        db.commit()
+    return db
+
+
+def _eligible():
+    """(path, acct, launcher, size, mtime) for every indexable transcript —
+    one stat per file, no reads."""
+    out = []
+    for label, launcher, root in HOMES:
+        for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
+            if "/-tmp" in f or ".orphaned-" in f or "-claude-jobs-" in f:
+                continue
+            try:
+                st = os.stat(f)
+            except OSError:
+                continue
+            if st.st_size > MIN_BYTES:
+                out.append((f, label, launcher, st.st_size, st.st_mtime))
+    return out
+
+
+def _gists_changed(db):
+    """summaries.json's mtime if it changed since the index last copied its
+    gists, else None."""
+    try:
+        cmt = str(os.path.getmtime(CACHE))
+    except OSError:
+        return None
+    row = db.execute("SELECT v FROM meta WHERE k='gists_mtime'").fetchone()
+    return None if row and row[0] == cmt else cmt
+
+
+def _sync_gists(db):
+    """Copy gists from summaries.json (their store of record) into the index
+    whenever that file changed since the last copy."""
+    cmt = _gists_changed(db)
+    if cmt is None:
+        return
+    cache = _load_cache()
+    for r in db.execute("SELECT id, sid, gist FROM sessions").fetchall():
+        g = (cache.get(r["sid"]) or {}).get("gist") or ""
+        if g != r["gist"]:
+            db.execute("UPDATE sessions SET gist=? WHERE id=?", (g, r["id"]))
+            db.execute("UPDATE fts SET gist=? WHERE rowid=?", (g, r["id"]))
+    db.execute("INSERT OR REPLACE INTO meta VALUES('gists_mtime', ?)", (cmt,))
+
+
+def update_index(db):
+    """Bring the index in line with the transcripts on disk: stat everything,
+    re-read (bounded) only what changed, drop what vanished. If another
+    process is already writing, answer from the index as it stands."""
+    files = _eligible()
+    known = {r["path"]: (r["size"], r["mtime"]) for r in
+             db.execute("SELECT path, size, mtime FROM sessions")}
+    todo = [x for x in files if known.get(x[0]) != (x[3], x[4])]
+    gone = set(known) - {x[0] for x in files}
+    if not todo and not gone and not _gists_changed(db):
+        return  # nothing moved: no write transaction at all
+    try:
+        db.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError:
+        return
+    if len(todo) > 200:
+        print("session-atlas: indexing %d transcripts (once; later calls read "
+              "only what changed)..." % len(todo), file=sys.stderr, flush=True)
+    cache = _load_cache() if todo else {}
+    for p in gone:
+        r = db.execute("SELECT id FROM sessions WHERE path=?", (p,)).fetchone()
+        db.execute("DELETE FROM fts WHERE rowid=?", (r["id"],))
+        db.execute("DELETE FROM sessions WHERE id=?", (r["id"],))
+    for n, (path, label, launcher, size, mtime) in enumerate(todo, 1):
+        old = db.execute("SELECT * FROM sessions WHERE path=?", (path,)).fetchone()
+        f = scan(path, dict(old) if old else None)
+        if f is None:
+            continue
+        sid = os.path.basename(path)[:-6]
+        gist = (cache.get(sid) or {}).get("gist") or ""
+        repo = _repo_of(f["cwd"]) if f["cwd"] else None
+        vals = (path, sid, label, launcher, size, mtime, f["start"], f["cwd"], repo,
+                f["name"], f["ai_title"], f["first"], f["summary"], gist)
+        if old:
+            rid = old["id"]
+            db.execute("UPDATE sessions SET path=?, sid=?, acct=?, launcher=?, size=?, "
+                       "mtime=?, start=?, cwd=?, repo=?, name=?, ai_title=?, first=?, "
+                       "summary=?, gist=? WHERE id=?", vals + (rid,))
+            db.execute("DELETE FROM fts WHERE rowid=?", (rid,))
+        else:
+            rid = db.execute("INSERT INTO sessions(path, sid, acct, launcher, size, mtime, "
+                             "start, cwd, repo, name, ai_title, first, summary, gist) "
+                             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals).lastrowid
+        db.execute("INSERT INTO fts(rowid, title, repo, first, summary, gist, body, deep) "
+                   "VALUES(?,?,?,?,?,?,?,?)",
+                   (rid, " ".join(x for x in (f["name"], f["ai_title"]) if x),
+                    (repo or "") + " " + (f["cwd"] or ""), f["first"], f["summary"],
+                    gist, f["body"], f["deep"]))
+        if n % 250 == 0:  # an interrupted first build keeps its progress
+            db.commit()
+            db.execute("BEGIN IMMEDIATE")
+    _sync_gists(db)
+    db.commit()
+
+
+def open_index():
+    db = _connect()
+    update_index(db)
+    return db
+
+
+def _row(r, deep=""):
+    return dict(mtime=r["mtime"], start=r["start"], acct=r["acct"],
+                launcher=r["launcher"], sid=r["sid"], path=r["path"], repo=r["repo"],
+                cwd=r["cwd"], name=r["name"] or None, gist=r["gist"] or "",
+                ai_title=r["ai_title"] or "", first=r["first"] or "",
+                summary=r["summary"] or "", deep=deep)
 
 
 def tail_records(path, tail_bytes=262144, keep=24):
@@ -290,33 +553,20 @@ def add_gists(rows):
                 r["name"] = c["name"]
 
 
-def build_deep_index(rows):
-    """Deep search index: frequency-ranked words from the transcript TAIL of
-    the newest TL_DEEP sessions, so search matches what a session actually
-    became — not just how it started. Mutates rows (deep/name) and persists
-    the words into the cache so --find shares the same recall for free."""
-    from collections import Counter
+def mirror_to_cache(rows):
+    """Keep summaries.json carrying each rendered session's name and deep
+    words. The index is the search store now; this file stays the gist store
+    of record and a stable read surface for sibling tools."""
     cache = _load_cache()
     dirty = False
-    for r in rows[:TL_DEEP]:
-        c = cache.get(r["sid"])
-        if c and c.get("deep_mtime") == int(r["mtime"]) and c.get("deep"):
-            r["deep"] = c["deep"]
-            if not r["name"] and c.get("name"):
-                r["name"] = c["name"]
-            continue
-        texts, late_name, late_title = tail_records(r["path"])
-        if late_name and not r["name"]:
-            r["name"] = late_name
-        if late_title:
-            r["ai_title"] = late_title
-        words = re.findall(r"[a-z0-9][a-z0-9_.-]{2,24}", " ".join(texts).lower())
-        # frequency-ranked so truncation drops rare noise, not alphabet ranges
-        r["deep"] = " ".join(w for w, _ in Counter(words).most_common(300))[:2500]
+    for r in rows:
         c = cache.setdefault(r["sid"], {})
-        c.update(mtime=int(r["mtime"]), deep=r["deep"], deep_mtime=int(r["mtime"]),
-                 name=c.get("name") or r["name"] or "")
-        dirty = True
+        want = dict(mtime=int(r["mtime"]), name=r["name"] or c.get("name") or "")
+        if r.get("deep"):
+            want.update(deep=r["deep"], deep_mtime=int(r["mtime"]))
+        if any(c.get(k) != v for k, v in want.items()):
+            c.update(want)
+            dirty = True
     if dirty:
         _save_cache(cache)
 
@@ -338,39 +588,14 @@ def live_status():
     return out
 
 
-def collect(days, cap):
+def collect(days, cap, db=None):
+    """The newest `cap` sessions active in the last `days`, from the index."""
+    db = db or open_index()
     cutoff = time.time() - days * 86400
-    rows = []
-    for label, launcher, root in HOMES:
-        for f in glob.glob(os.path.join(root, "*", "*.jsonl")):
-            if "/-tmp" in f or ".orphaned-" in f or "-claude-jobs-" in f:
-                continue
-            mt = os.path.getmtime(f)
-            if mt >= cutoff and os.path.getsize(f) > 2000:
-                rows.append((mt, label, launcher, f))
-    rows.sort(reverse=True)
-    out = []
-    for mt, label, launcher, f in rows[:cap]:
-        cwd, name, ai_title, first, summ, started = scan(f)
-        if not cwd:
-            continue
-        start = None
-        if started:
-            try:
-                start = calendar.timegm(time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S"))
-            except Exception:
-                start = None
-        # worktree cwds (<repo>/.claude/worktrees/<x>) consolidate silently into
-        # their parent repo — worktrees are plumbing the operator never sees
-        repo = os.path.basename(cwd)
-        if "/.claude/worktrees/" in cwd:
-            repo = os.path.basename(cwd.partition("/.claude/worktrees/")[0])
-        out.append(dict(mtime=mt, start=start, acct=label, launcher=launcher,
-                        sid=os.path.basename(f)[:-6], path=f,
-                        repo=repo, cwd=cwd, name=name, gist="",
-                        ai_title=(ai_title or "")[:200],
-                        first=(first or "")[:200], summary=(summ or "")[:280]))
-    return out
+    return [_row(r, r["deep"]) for r in db.execute(
+        "SELECT s.*, f.deep AS deep FROM sessions s JOIN fts f ON f.rowid = s.id "
+        "WHERE s.cwd IS NOT NULL AND s.mtime >= ? ORDER BY s.mtime DESC LIMIT ?",
+        (cutoff, cap))]
 
 
 def _ago(secs):
@@ -836,46 +1061,52 @@ Updated %s.</div></div></header>
             + LD_JS + "</body></html>")
 
 
-def _searchable(rows):
-    """Attach cached gist/deep words so --find and --resolve share the
-    ladder's recall without re-reading any transcript."""
-    cache = _load_cache()
-    for r in rows:
-        c = cache.get(r["sid"])
-        if c:
-            r["gist"] = r.get("gist") or c.get("gist") or ""
-            r["deep"] = c.get("deep") or ""
-            if not r["name"] and c.get("name"):
-                r["name"] = c["name"]
-    return rows
+def _fts_query(terms, op, prefix):
+    """Safe FTS5 query from free text: every whitespace term becomes a quoted
+    term (a dotted/dashed term becomes a phrase), optionally a prefix term, so
+    no user input is ever parsed as FTS5 syntax."""
+    parts = []
+    for t in terms:
+        toks = re.findall(r"\w+", t)
+        if toks:
+            parts.append('"%s"%s' % (" ".join(toks), "*" if prefix else ""))
+    return (" %s " % op).join(parts)
 
 
-def _score(rows, query):
-    """All-terms-match dominates; then weighted hit count; then recency.
-    The session running this search (CLAUDE_CODE_SESSION_ID) is excluded."""
+def search(db, query, limit):
+    """Tiers, each ranked by bm25: all terms as whole words, then all terms as
+    word prefixes, then any term. The session running this search
+    (CLAUDE_CODE_SESSION_ID) is excluded."""
     terms = [w for w in query.lower().split() if w]
     me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    scored = []
-    for r in rows:
-        if r["sid"] == me:
+    out, seen = [], set()
+    sql = ("SELECT s.*, bm25(fts, %s) AS score FROM fts JOIN sessions s ON s.id = fts.rowid "
+           "WHERE fts MATCH ? AND s.cwd IS NOT NULL AND s.sid != ? "
+           "ORDER BY score, s.mtime DESC LIMIT ?" % ", ".join(map(str, WEIGHTS)))
+    for op, prefix in (("AND", False), ("AND", True), ("OR", True)):
+        q = _fts_query(terms, op, prefix)
+        if not q or len(out) >= limit or (op == "OR" and len(terms) < 2):
             continue
-        head = " ".join([r["repo"], r["name"] or "", r["ai_title"], r["first"],
-                         r["summary"], r.get("gist") or ""]).lower()
-        deep = r.get("deep") or ""
-        matched = sum(1 for w in terms if w in head or w in deep)
-        if not matched:
-            continue
-        # head hits weigh more than deep-index hits
-        weight = sum(3 * head.count(w) + deep.count(w) for w in terms)
-        scored.append(((matched == len(terms)), matched, weight, r))
-    scored.sort(key=lambda s: (-s[0], -s[1], -s[2], -s[3]["mtime"]))
-    return [r for _, _, _, r in scored]
+        for r in db.execute(sql, (q, me, limit)):
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append(_row(r))
+    return out[:limit]
 
 
-def find(rows, query, limit=8):
+def by_sid(db, prefix):
+    """Every indexed copy of the session(s) whose id starts with `prefix`,
+    newest first — an index lookup, no transcript is read."""
+    p = prefix.lower().replace("%", "").replace("_", "")
+    return [_row(r) for r in db.execute(
+        "SELECT * FROM sessions WHERE sid LIKE ? AND cwd IS NOT NULL "
+        "ORDER BY mtime DESC", (p + "%",))]
+
+
+def find(db, query, limit=8):
     """Token-cheap lookup for in-session use: compact matches, resume-ready.
     A skill should call THIS, never read the atlas HTML into context."""
-    hits = _score(_searchable(rows), query)
+    hits = search(db, query, limit)
     if not hits:
         print(f"no sessions match: {query}")
         return
@@ -888,15 +1119,16 @@ def find(rows, query, limit=8):
         print(f"        cd {r['cwd']} && {r['launcher']} --resume {r['sid']}")
 
 
-def resolve(rows, query, limit=5):
+def resolve(db, query, limit=5):
     """Machine-readable resolution for agents and sibling tools. Accepts a
-    sid prefix (>=6 hex chars) or free-text search. TSV:
+    sid prefix (>=6 hex chars) or free-text search; a hex-looking word that
+    is no session's id falls through to topic search. TSV:
     sid <TAB> acct <TAB> launcher <TAB> cwd <TAB> running|- <TAB> iso-mtime <TAB> topic"""
-    rows = _searchable(rows)
+    hits = []
     if re.fullmatch(r"[0-9a-fA-F-]{6,36}", query):
-        hits = [r for r in rows if r["sid"].startswith(query.lower())]
-    else:
-        hits = _score(rows, query)
+        hits = by_sid(db, query)
+    if not hits:
+        hits = search(db, query, limit)
     live = live_status()
     for r in hits[:limit]:
         topic = re.sub(r"\s+", " ",
@@ -911,11 +1143,23 @@ def resolve(rows, query, limit=5):
     return 0
 
 
-def import_session(rows, sid_prefix, to_label=None, force=False):
+def index_status(db):
+    """One line per account plus the index file itself — for the status verb."""
+    for r in db.execute("SELECT acct, COUNT(*) n, MIN(mtime) lo, MAX(mtime) hi, "
+                        "SUM(gist != '') g FROM sessions WHERE cwd IS NOT NULL "
+                        "GROUP BY acct ORDER BY acct"):
+        print("%s\t%d sessions\t%s .. %s\t%d with gist" % (
+            r["acct"], r["n"], time.strftime("%Y-%m-%d", time.localtime(r["lo"])),
+            time.strftime("%Y-%m-%d", time.localtime(r["hi"])), r["g"]))
+    print("index\t%s\t%.1f MB" % (INDEX, os.path.getsize(INDEX) / 1e6))
+    return 0
+
+
+def import_session(db, sid_prefix, to_label=None, force=False):
     """Copy a session's transcript into another account's projects tree so
     the session can be resumed (as an independent copy) under that account's
     launcher. Refuses live sessions unless --force."""
-    hits = [r for r in rows if r["sid"].startswith(sid_prefix.lower())]
+    hits = by_sid(db, sid_prefix)
     if not hits:
         print(f"no session matches sid prefix: {sid_prefix}", file=sys.stderr)
         return 1
@@ -992,7 +1236,7 @@ def refresh_http():
             respond(b"404 Not Found", b"unknown session")
             return 0
         launcher, tpath = hit
-        cwd = scan(tpath)[0]
+        cwd = (scan(tpath) or {}).get("cwd")
         if not cwd or not os.path.isdir(cwd):
             cwd = os.path.expanduser("~")
         env = dict(os.environ)
@@ -1063,27 +1307,43 @@ def main():
         return refresh_http()
     days = int(a[a.index("--days") + 1]) if "--days" in a else 45
     cap = int(a[a.index("--max") + 1]) if "--max" in a else 140
-    if "--find" in a:
-        rows = collect(max(days, 90), 400)
-        return find(rows, a[a.index("--find") + 1]) or 0
-    if "--resolve" in a:
-        rows = collect(max(days, 90), 400)
-        return resolve(rows, a[a.index("--resolve") + 1])
-    if "--gist-queue" in a:
-        limit = int(a[a.index("--limit") + 1]) if "--limit" in a else GIST_BATCH
-        return gist_queue(collect(max(days, GIST_DAYS), TL_MAX), limit)
     if "--gist-write" in a:
         return gist_write(a[a.index("--gist-write") + 1])
+    if "--reindex" in a:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(INDEX + suffix)
+            except OSError:
+                pass
+    try:
+        db = open_index()
+    except sqlite3.Error as e:
+        print("session-atlas: cannot open the index %s: %s (Python's sqlite3 needs "
+              "FTS5)" % (INDEX, e), file=sys.stderr)
+        return 2
+    # --find / --resolve / --import search EVERY indexed session: no window
+    if "--find" in a:
+        return find(db, a[a.index("--find") + 1]) or 0
+    if "--resolve" in a:
+        return resolve(db, a[a.index("--resolve") + 1])
+    if "--index-status" in a:
+        return index_status(db)
+    if "--gist-queue" in a:
+        limit = int(a[a.index("--limit") + 1]) if "--limit" in a else GIST_BATCH
+        return gist_queue(collect(max(days, GIST_DAYS), TL_MAX, db), limit)
     if "--import" in a:
         to = a[a.index("--to") + 1] if "--to" in a else None
-        rows = collect(max(days, 90), 1000)
-        return import_session(rows, a[a.index("--import") + 1], to, "--force" in a)
-    # one scan feeds every page: the ladder carries EVERY session in the
+        return import_session(db, a[a.index("--import") + 1], to, "--force" in a)
+    if "--reindex" in a:
+        return index_status(db)
+    # one query feeds every page: the ladder carries EVERY session in the
     # window, the atlas stays the curated newest-N list with fresh gists
-    tl_rows = collect(days, TL_MAX)
+    tl_rows = collect(days, TL_MAX, db)
     rows = tl_rows[:cap]
     add_gists(tl_rows)
-    build_deep_index(tl_rows)
+    for i, r in enumerate(tl_rows):  # keep the page's inline search index small
+        r["deep"] = (r.get("deep") or "")[:2500] if i < TL_DEEP else ""
+    mirror_to_cache(tl_rows)
     os.makedirs(HTML_DIR, exist_ok=True)
     open(OUT, "w").write(render(rows, days))
     open(OUT3, "w").write(render_ladder(tl_rows, days))

@@ -13,8 +13,9 @@ Read-only. Gather and present compactly (a few lines, not a report):
    `ls <projects>/*/*.jsonl | wc -l`).
 3. **Layers:** publish_cmd / gist backend / refresh_url — configured or off. Off is
    a valid state, not an error (local pages, cached-only gists, no page buttons).
-4. **Cache:** entry count and gist/deep coverage from
-   `~/.cache/session-atlas/summaries.json`; page freshness = mtime of
+4. **Index:** `${CLAUDE_PLUGIN_ROOT}/scripts/session-atlas --index-status` prints
+   one line per account (sessions indexed, date range, how many carry a gist) and
+   the index file's size. Page freshness = mtime of
    `~/.cache/session-atlas/html/session-ladder.html`.
 
 If a configured path doesn't exist (dead projects dir, missing publish script),
