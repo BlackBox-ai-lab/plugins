@@ -198,6 +198,23 @@ if command -v gh >/dev/null && slug=$(gh repo view --json nameWithOwner -q .name
   else
     bad "other GitHub identities on this repo's records: $(printf '%s' "$others" | tr '\n' ' ')— PRs and issues cannot be deleted; see CLAUDE.md"
   fi
+  # The pusher is a separate leak from the commit author: every push is a public
+  # event naming whoever authenticated. Read it the way a stranger does (logged
+  # out, no gh token): the events API actors and the /activity page's pushers.
+  if command -v curl >/dev/null; then
+    pushers=$( { curl -fsS "https://api.github.com/repos/$slug/events?per_page=100" 2>/dev/null \
+                   | python3 -c 'import json,sys; [print(e["actor"]["login"]) for e in json.load(sys.stdin)]' 2>/dev/null;
+                 curl -fsSL "https://github.com/$slug/activity" 2>/dev/null \
+                   | grep -oE '"pusher":\{"login":"[^"]+"' | sed -E 's/.*"login":"//; s/"$//'; } \
+               | sort -u | grep -v -x -E "$(printf '%s' "$ALLOWED_LOGINS" | tr ' ' '|')" || true )
+    if [ -z "$pushers" ]; then
+      ok "public events and the activity page name only the Blackbox AI Labs account as actor/pusher"
+    else
+      bad "other identities in public events or the activity page: $(printf '%s' "$pushers" | tr '\n' ' ')— only delete-and-recreate purges these; push via the brand credential"
+    fi
+  else
+    warn "curl not available — skipped the public pusher check"
+  fi
 else
   warn "could not read GitHub records (gh not available)"
 fi
