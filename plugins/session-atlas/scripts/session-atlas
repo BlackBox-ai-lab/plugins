@@ -115,7 +115,8 @@ def _text(content):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        return " ".join(b["text"] for b in content
+                        if isinstance(b, dict) and isinstance(b.get("text"), str))
     return ""
 
 
@@ -138,21 +139,25 @@ def _parse_lines(data):
         if not isinstance(rec, dict):
             continue
         typ = rec.get("type")
-        if f["started"] is None and rec.get("timestamp"):
+        # a field of the wrong type (a malformed record) counts as absent
+        def sv(k):
+            v = rec.get(k)
+            return v if isinstance(v, str) and v else None
+        if f["started"] is None and sv("timestamp"):
             f["started"] = rec["timestamp"]
-        if f["cwd"] is None and rec.get("cwd"):
+        if f["cwd"] is None and sv("cwd"):
             f["cwd"] = rec["cwd"]
-        if typ == "summary" and rec.get("summary"):
+        if typ == "summary" and sv("summary"):
             f["summary"] = rec["summary"]
         # the harness writes structured rename records — canonical, last wins
-        if typ == "custom-title" and rec.get("customTitle"):
+        if typ == "custom-title" and sv("customTitle"):
             f["name"] = rec["customTitle"]
-        elif typ == "agent-name" and rec.get("agentName"):
+        elif typ == "agent-name" and sv("agentName"):
             f["name"] = rec["agentName"]
         # the title Claude generates and DISPLAYS. Deliberately NOT folded
         # into `name`, which means "the operator named this" — other logic
         # keys on that distinction. Rewritten as a session evolves.
-        elif typ == "ai-title" and rec.get("aiTitle"):
+        elif typ == "ai-title" and sv("aiTitle"):
             f["ai_title"] = rec["aiTitle"]
         m = rec.get("message") or {}
         if not isinstance(m, dict):
@@ -263,6 +268,10 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
 WEIGHTS = (10.0, 6.0, 3.0, 3.0, 4.0, 1.5, 1.0)
 
 
+class IndexBusy(Exception):
+    pass
+
+
 def _prefetch(path):
     """Read a file front to back once. A cold query touches pages scattered
     across the index, and on a spinning disk those random reads cost far more
@@ -290,7 +299,11 @@ def _connect():
     # the index is a rebuildable cache: skip the per-commit fsync
     db.execute("PRAGMA synchronous=NORMAL")
     if db.execute("PRAGMA user_version").fetchone()[0] != INDEX_VERSION:
-        db.execute("BEGIN IMMEDIATE")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            raise IndexBusy("the index is being rebuilt by another process; "
+                            "retry shortly (%s)" % e)
         # re-check under the lock: a concurrent first run may have just built it
         if db.execute("PRAGMA user_version").fetchone()[0] == INDEX_VERSION:
             db.rollback()
@@ -346,34 +359,63 @@ def _sync_gists(db):
     db.execute("INSERT OR REPLACE INTO meta VALUES('gists_mtime', ?)", (cmt,))
 
 
+def _plan(db, files):
+    """(todo, gone) against the index as it stands now. A row whose account
+    root is missing right now (an unmounted disk, another HOME) is kept, not
+    dropped: an absent directory is not evidence its transcripts are gone."""
+    known = {r["path"]: ((r["size"], r["mtime"]), r["acct"]) for r in
+             db.execute("SELECT path, size, mtime, acct FROM sessions")}
+    todo = [x for x in files if (known.get(x[0]) or (None,))[0] != (x[3], x[4])]
+    absent = {label for label, _l, root in HOMES if not os.path.isdir(root)}
+    on_disk = {x[0] for x in files}
+    gone = [p for p, (_st, acct) in known.items()
+            if p not in on_disk and acct not in absent]
+    return todo, gone
+
+
+def _stub(path):
+    """Facts for a transcript that could not be parsed: indexed with no cwd,
+    so no query returns it and it is not re-read until it changes."""
+    return dict(cwd=None, start=None, name="", ai_title="", first="", summary="",
+                body="", deep="")
+
+
 def update_index(db):
     """Bring the index in line with the transcripts on disk: stat everything,
     re-read (bounded) only what changed, drop what vanished. If another
     process is already writing, answer from the index as it stands."""
     files = _eligible()
-    known = {r["path"]: (r["size"], r["mtime"]) for r in
-             db.execute("SELECT path, size, mtime FROM sessions")}
-    todo = [x for x in files if known.get(x[0]) != (x[3], x[4])]
-    gone = set(known) - {x[0] for x in files}
+    todo, gone = _plan(db, files)
     if not todo and not gone and not _gists_changed(db):
         return  # nothing moved: no write transaction at all
     try:
         db.execute("BEGIN IMMEDIATE")
     except sqlite3.OperationalError:
         return
+    # re-plan under the lock: a concurrent call may have done the work already
+    todo, gone = _plan(db, files)
     if len(todo) > 200:
         print("session-atlas: indexing %d transcripts (once; later calls read "
               "only what changed)..." % len(todo), file=sys.stderr, flush=True)
     cache = _load_cache() if todo else {}
     for p in gone:
         r = db.execute("SELECT id FROM sessions WHERE path=?", (p,)).fetchone()
+        if r is None:
+            continue
         db.execute("DELETE FROM fts WHERE rowid=?", (r["id"],))
         db.execute("DELETE FROM sessions WHERE id=?", (r["id"],))
     for n, (path, label, launcher, size, mtime) in enumerate(todo, 1):
         old = db.execute("SELECT * FROM sessions WHERE path=?", (path,)).fetchone()
-        f = scan(path, dict(old) if old else None)
+        if old and (old["size"], old["mtime"]) == (size, mtime):
+            continue  # another call indexed it between our commits
+        try:
+            f = scan(path, dict(old) if old else None)
+        except Exception as e:  # one malformed transcript must not stop the rest
+            print("session-atlas: skipping unreadable transcript %s (%s: %s)"
+                  % (path, type(e).__name__, e), file=sys.stderr)
+            f = None
         if f is None:
-            continue
+            f = _stub(path)
         sid = os.path.basename(path)[:-6]
         gist = (cache.get(sid) or {}).get("gist") or ""
         repo = _repo_of(f["cwd"]) if f["cwd"] else None
@@ -396,7 +438,10 @@ def update_index(db):
                     gist, f["body"], f["deep"]))
         if n % 250 == 0:  # an interrupted first build keeps its progress
             db.commit()
-            db.execute("BEGIN IMMEDIATE")
+            try:
+                db.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                return  # another call took over; it finishes the rest
     _sync_gists(db)
     db.commit()
 
@@ -431,6 +476,8 @@ def tail_records(path, tail_bytes=262144, keep=24):
             try:
                 rec = json.loads(ln)
             except Exception:
+                continue
+            if not isinstance(rec, dict):
                 continue
             if rec.get("type") == "custom-title" and rec.get("customTitle"):
                 late_name = rec["customTitle"]
@@ -535,7 +582,8 @@ def _load_cache():
 
 def _save_cache(cache):
     cutoff = time.time() - PRUNE_DAYS * 86400
-    cache = {k: v for k, v in cache.items() if v.get("mtime", 0) >= cutoff}
+    cache = {k: v for k, v in cache.items()
+             if max(v.get("mtime", 0), v.get("seen_mtime", 0), v.get("deep_mtime", 0)) >= cutoff}
     os.makedirs(CACHE_DIR, exist_ok=True)
     json.dump(cache, open(CACHE, "w"))
 
@@ -561,7 +609,12 @@ def mirror_to_cache(rows):
     dirty = False
     for r in rows:
         c = cache.setdefault(r["sid"], {})
-        want = dict(mtime=int(r["mtime"]), name=r["name"] or c.get("name") or "")
+        # `mtime` is the version a gist was written for (_needs_gist compares
+        # it): stamping the session's current mtime over an old gist would
+        # mark that gist current. `seen_mtime` keeps the entry from pruning.
+        want = dict(seen_mtime=int(r["mtime"]), name=r["name"] or c.get("name") or "")
+        if not c.get("gist"):
+            want["mtime"] = int(r["mtime"])
         if r.get("deep"):
             want.update(deep=r["deep"], deep_mtime=int(r["mtime"]))
         if any(c.get(k) != v for k, v in want.items()):
@@ -1097,10 +1150,11 @@ def search(db, query, limit):
 def by_sid(db, prefix):
     """Every indexed copy of the session(s) whose id starts with `prefix`,
     newest first — an index lookup, no transcript is read."""
-    p = prefix.lower().replace("%", "").replace("_", "")
+    p = prefix.lower()
+    # a range scan on sessions_sid ('~' sorts after every hex digit and '-')
     return [_row(r) for r in db.execute(
-        "SELECT * FROM sessions WHERE sid LIKE ? AND cwd IS NOT NULL "
-        "ORDER BY mtime DESC", (p + "%",))]
+        "SELECT * FROM sessions WHERE sid >= ? AND sid < ? AND cwd IS NOT NULL "
+        "ORDER BY mtime DESC", (p, p + "~"))]
 
 
 def find(db, query, limit=8):
@@ -1121,13 +1175,17 @@ def find(db, query, limit=8):
 
 def resolve(db, query, limit=5):
     """Machine-readable resolution for agents and sibling tools. Accepts a
-    sid prefix (>=6 hex chars) or free-text search; a hex-looking word that
-    is no session's id falls through to topic search. TSV:
+    sid prefix (>=6 hex chars) or free-text search. An id that is not in the
+    index is a miss (exit 1), never a session whose text happens to quote that
+    id; only a short all-letter hex word ("facade", "decade") that is no
+    session's id falls through to topic search. TSV:
     sid <TAB> acct <TAB> launcher <TAB> cwd <TAB> running|- <TAB> iso-mtime <TAB> topic"""
-    hits = []
     if re.fullmatch(r"[0-9a-fA-F-]{6,36}", query):
         hits = by_sid(db, query)
-    if not hits:
+        word = len(query) < 8 and re.fullmatch(r"[a-fA-F]+", query)
+        if not hits and word:
+            hits = search(db, query, limit)
+    else:
         hits = search(db, query, limit)
     live = live_status()
     for r in hits[:limit]:
@@ -1317,9 +1375,13 @@ def main():
                 pass
     try:
         db = open_index()
+    except IndexBusy as e:
+        print("session-atlas: %s" % e, file=sys.stderr)
+        return 2
     except sqlite3.Error as e:
-        print("session-atlas: cannot open the index %s: %s (Python's sqlite3 needs "
-              "FTS5)" % (INDEX, e), file=sys.stderr)
+        hint = " (Python's sqlite3 needs FTS5)" if "fts5" in str(e).lower() else ""
+        print("session-atlas: cannot open the index %s: %s%s" % (INDEX, e, hint),
+              file=sys.stderr)
         return 2
     # --find / --resolve / --import search EVERY indexed session: no window
     if "--find" in a:

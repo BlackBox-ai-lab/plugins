@@ -16,9 +16,11 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/session-atlas --resolve "<sid-prefix or words>"
 
 Output: one TSV row per hit (max 5), fields:
 `sid  account  launcher  cwd  running|-  iso-mtime  topic`.
-A 6+ char hex prefix matches sids (an index lookup, any age); a hex-looking
-word that is no session's id, and anything else, is a topic search (all-terms
-ranked). Exit 1 with a stderr note when nothing matches.
+A 6+ char hex prefix matches sids (an index lookup, any age). An id that is
+not indexed is a miss, never a session that merely quotes that id; only a short
+all-letter hex word ("facade") that is no session's id falls through to topic
+search. Anything else is a topic search (all-terms ranked). Exit 1 with a
+stderr note when nothing matches.
 
 Consume the fields; don't re-derive them. `running` means a live instance holds
 the session now — resuming it would fork the conversation.

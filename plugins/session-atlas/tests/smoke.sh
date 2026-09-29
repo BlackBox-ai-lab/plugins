@@ -167,16 +167,81 @@ PY
 python3 "$ENGINE" --resolve 99999999 | grep -q "Quokka migration finished"
 python3 "$ENGINE" --resolve "quokka kickoff" | head -1 | grep -q "^$BIG	"
 
-# a hex-looking topic that is no session's id falls through to topic search
+# a short all-letter hex WORD that is no session's id falls through to topic search
 python3 "$ENGINE" --resolve "deadbee" 2>/dev/null && { echo "FAIL: deadbee matched"; exit 1; }
-printf '{"type":"custom-title","customTitle":"cafe01 menu rework"}\n' >> "$PROJ/$BIG.jsonl"
-python3 "$ENGINE" --resolve cafe01 | head -1 | grep -q "^$BIG	"
+printf '{"type":"custom-title","customTitle":"facade menu rework"}\n' >> "$PROJ/$BIG.jsonl"
+python3 "$ENGINE" --resolve facade | head -1 | grep -q "^$BIG	"
+
+# ...but an ID that is not indexed is a miss (exit 1), never the session that
+# merely quotes it (a handoff naming its predecessor, a VPS-only session)
+QUOTER="abcdef01-1111-2222-3333-444444444444"
+{ printf '{"type":"user","cwd":"/data/quoter","timestamp":"2026-07-22T10:00:00Z","message":{"content":"handoff: continue the work of session 9f8e7d6c-aaaa-bbbb-cccc-dddddddddddd"}}\n'
+  for i in $(seq 40); do
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"padding line %d to clear the small-file filter ................................"}]}}\n' "$i"
+  done
+} > "$PROJ/$QUOTER.jsonl"
+python3 "$ENGINE" --find "9f8e7d6c" | grep -q "claude --resume $QUOTER"   # it IS indexed
+for Q in 9f8e7d6c 9f8e7d6c-aaaa-bbbb-cccc-dddddddddddd; do
+  if python3 "$ENGINE" --resolve "$Q" >/dev/null 2>&1; then
+    echo "FAIL: --resolve $Q returned a session that only quotes that id"; exit 1
+  fi
+done
+python3 "$ENGINE" --resolve abcdef01 | grep -q "^$QUOTER	"
+
+# one malformed transcript never breaks a call, now or on the next call, and
+# is not re-read until it changes
+BAD="0badbad0-1111-2222-3333-444444444444"
+{ printf '{"type":"user","cwd":"/data/bad","timestamp":"2026-07-22T10:00:00Z","message":{"content":[{"type":"text","text":null}]}}\n'
+  printf '{"type":"custom-title","customTitle":{"not":"a string"}}\n'
+  printf '{"type":"ai-title","aiTitle":42}\n'
+  printf '"a bare string record"\n'
+  printf '{"type":"user","cwd":"/data/bad","message":{"content":"walrus tuning notes"}}\n'
+  for i in $(seq 40); do
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"padding line %d to clear the small-file filter ................................"}]}}\n' "$i"
+  done
+} > "$PROJ/$BAD.jsonl"
+python3 "$ENGINE" --find "walrus" | grep -q "claude --resume $BAD"
+python3 "$ENGINE" --find "frobnicator template" | grep -q "claude --resume $SID"
+python3 "$ENGINE" >/dev/null
+
+# a missing account root (unmounted, another HOME) does not empty the index
+mv "$TMP/home/.claude/projects" "$TMP/home/.claude/projects.away"
+python3 "$ENGINE" --resolve aaaaaaaa >/dev/null 2>&1 || true
+mv "$TMP/home/.claude/projects.away" "$TMP/home/.claude/projects"
+python3 -c "
+import sqlite3; db=sqlite3.connect('$TMP/home/.cache/session-atlas/index.db')
+n=db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]
+assert n >= 5, 'index emptied while the root was missing: %d rows' % n"
+
+# the exact-id lookup is an index lookup, not a table scan: EXPLAIN the SQL
+# the engine itself runs, captured from its connection
+python3 - "$ENGINE" <<'PY2'
+import importlib.machinery, importlib.util, sys
+ld = importlib.machinery.SourceFileLoader("sa", sys.argv[1])
+sa = importlib.util.module_from_spec(importlib.util.spec_from_loader("sa", ld)); ld.exec_module(sa)
+db = sa._connect(); seen = []
+db.set_trace_callback(seen.append); sa.by_sid(db, "abcdef01"); db.set_trace_callback(None)
+q = [x for x in seen if "FROM sessions" in x][0]
+plan = " ".join(str(r[-1]) for r in db.execute("EXPLAIN QUERY PLAN " + q))
+assert "sessions_sid" in plan, (q, plan)
+PY2
 
 # summaries.json keeps carrying names for sibling tools that read it directly
 python3 "$ENGINE" >/dev/null
 python3 -c "
 import json; c=json.load(open('$TMP/home/.cache/session-atlas/summaries.json'))
 assert c['$RENAMED']['name']=='Operator rename wins', c['$RENAMED']
+assert c['$SID']['gist']=='Smoke-test gist line.', c['$SID']"
+
+# a render never marks an old gist current: a session that moved after its
+# gist was written is queued again
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"frobnicator follow-up work"}]}}\n' >> "$PROJ/$SID.jsonl"
+python3 "$ENGINE" >/dev/null
+python3 "$ENGINE" --gist-queue --limit 50 >/dev/null
+python3 -c "
+import json; q=json.load(open('$TMP/home/.cache/session-atlas/gist-queue.json'))
+assert '$SID' in [i['sid'] for i in q['items']], 'stale gist not re-queued'
+c=json.load(open('$TMP/home/.cache/session-atlas/summaries.json'))
 assert c['$SID']['gist']=='Smoke-test gist line.', c['$SID']"
 
 # a stale index schema is rebuilt, not trusted
