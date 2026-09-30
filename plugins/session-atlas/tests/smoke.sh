@@ -265,4 +265,157 @@ done
 touch -d "1 hour ago" "$PROJ"/12345673-*.jsonl   # the exact match is the OLDER one
 python3 "$ENGINE" --resolve "ledger build 3" | head -1 | grep -q "ledger build 3$"
 
+# --- the full-text layer -----------------------------------------------------
+# A helper that loads the engine and reports what the index stores and what the
+# incremental reader was asked to do, so the tests assert on mechanism, not luck.
+FT="$TMP/ft.py"
+cat > "$FT" <<'PYEOF'
+import importlib.machinery, importlib.util, json, os, sys
+ld = importlib.machinery.SourceFileLoader("sa", os.environ["ENGINE"])
+sa = importlib.util.module_from_spec(importlib.util.spec_from_loader("sa", ld)); ld.exec_module(sa)
+db = sa._connect()
+calls = []
+orig = sa.ft_extract
+def spy(path, off, room):
+    calls.append(off)
+    return orig(path, off, room)
+sa.ft_extract = spy
+cmd = sys.argv[1]
+if cmd == "meta":  # (offset consumed, text length, capped) for one session
+    r = db.execute("SELECT m.off, m.tlen, m.capped FROM ftmeta m JOIN sessions s ON s.id = m.id "
+                   "WHERE s.sid = ?", (sys.argv[2],)).fetchone()
+    print(json.dumps(tuple(r) if r else None))
+elif cmd == "cap":
+    print(sa.FT_CAP)
+elif cmd == "update":  # run one index update, report the offsets it read from
+    sa.update_index(db); db.commit()
+    print(json.dumps(calls))
+PYEOF
+ftmeta() { ENGINE="$ENGINE" python3 "$FT" meta "$1"; }
+ftupdate() { ENGINE="$ENGINE" python3 "$FT" update; }
+jfield() { python3 -c "import json,sys; print(json.loads(sys.argv[1])[int(sys.argv[2])])" "$1" "$2"; }
+lines_pad() { for i in $(seq "${1:-40}"); do printf '{"type":"assistant","message":{"content":[{"type":"text","text":"padding line %d to clear the small-file filter ................................"}]}}\n' "$i"; done; }
+
+# 1. a term that lives only in a tool_result in the MIDDLE of a large transcript
+#    is found; the head and tail windows cannot see it
+MID="11111111-2222-4333-8444-555555555555"
+python3 - "$PROJ/$MID.jsonl" <<'PY'
+import json, sys
+def w(fh, o): fh.write(json.dumps(o) + "\n")
+with open(sys.argv[1], "w") as fh:
+    w(fh, {"type": "user", "cwd": "/data/mid-repo", "timestamp": "2026-07-22T10:00:00Z",
+           "message": {"content": "inspect the quarterly widget report"}})
+    for i in range(3000):  # ~1 MB of records that carry no searchable text
+        w(fh, {"type": "system", "note": "bookkeeping %d " % i + "x" * 300})
+    w(fh, {"type": "assistant", "message": {"content": [
+        {"type": "thinking", "thinking": "private musing about lemniscate"},
+        {"type": "tool_use", "id": "t1", "name": "Bash",
+         "input": {"command": "grep -r marmalade-sprocket /srv/reports"}}]}})
+    w(fh, {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": "report.txt: vermicelli-quasar reconciled at 41 percent"}]}})
+    w(fh, {"type": "user", "isMeta": True, "message": {"content": "injected skill text about zeppelinesque"}})
+    for i in range(3000):
+        w(fh, {"type": "system", "note": "bookkeeping %d " % i + "y" * 300})
+    w(fh, {"type": "assistant", "message": {"content": [{"type": "text", "text": "the report is done"}]}})
+PY
+test "$(stat -c %s "$PROJ/$MID.jsonl")" -gt 1500000
+python3 "$ENGINE" --find "vermicelli-quasar" | grep -q "claude --resume $MID"
+python3 "$ENGINE" --find "marmalade sprocket" | grep -q "claude --resume $MID"   # a tool_use input
+if python3 "$ENGINE" --find "lemniscate" | grep -q "$MID"; then
+  echo "FAIL: a thinking block was indexed"; exit 1; fi
+if python3 "$ENGINE" --find "zeppelinesque" | grep -q "$MID"; then
+  echo "FAIL: an injected (isMeta) turn was indexed"; exit 1; fi
+# several words that appear somewhere in the transcript, none of them in its title
+python3 "$ENGINE" --resolve "widget vermicelli reconciled" | head -1 | grep -q "^$MID	"
+python3 "$ENGINE" --index-status | grep -q "^fulltext	"
+
+# 2. appending makes new terms findable by reading ONLY the new bytes
+M0="$(ftmeta "$MID")"; OFF0="$(jfield "$M0" 0)"
+test "$OFF0" = "$(stat -c %s "$PROJ/$MID.jsonl")"
+if python3 "$ENGINE" --find "nautilus-gasket" | grep -q "$MID"; then echo "FAIL: found before written"; exit 1; fi
+printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"kiln log: nautilus-gasket replaced"}]}}\n' >> "$PROJ/$MID.jsonl"
+# a record still being written (no newline yet) is left for the next call
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"half-written obsidian-turnip' >> "$PROJ/$MID.jsonl"
+test "$(ftupdate)" = "[$OFF0]"      # the reader started at the stored offset, not at 0
+python3 "$ENGINE" --find "nautilus-gasket" | grep -q "claude --resume $MID"
+python3 "$ENGINE" --find "vermicelli-quasar" | grep -q "claude --resume $MID"   # earlier text kept
+M1="$(ftmeta "$MID")"
+test "$(jfield "$M1" 0)" -gt "$OFF0"
+test "$(jfield "$M1" 1)" -gt "$(jfield "$M0" 1)"
+test "$(jfield "$M1" 0)" -lt "$(stat -c %s "$PROJ/$MID.jsonl")"   # the unfinished line is not consumed
+if python3 "$ENGINE" --find "obsidian-turnip" | grep -q "$MID"; then echo "FAIL: partial line read"; exit 1; fi
+printf '"}]}}\n' >> "$PROJ/$MID.jsonl"    # the record completes
+python3 "$ENGINE" --find "obsidian-turnip" | grep -q "claude --resume $MID"
+test "$(ftupdate)" = "[]"                 # nothing new: nothing read
+
+# 3. a truncated file, and a replaced file, are rebuilt from byte 0
+{ head -c 3000 "$PROJ/$MID.jsonl" | head -n -1
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"after truncation: pumpernickel-lattice"}]}}\n'
+  lines_pad; } > "$TMP/short.jsonl"
+mv "$TMP/short.jsonl" "$PROJ/$MID.jsonl"
+test "$(stat -c %s "$PROJ/$MID.jsonl")" -lt "$(jfield "$M1" 0)"
+test "$(ftupdate)" = "[0]"
+python3 "$ENGINE" --find "pumpernickel-lattice" | grep -q "claude --resume $MID"
+if python3 "$ENGINE" --find "vermicelli-quasar" | grep -q "$MID"; then echo "FAIL: stale text after truncation"; exit 1; fi
+# replaced by a LARGER file with a different beginning: size >= offset, first bytes differ
+{ printf '{"type":"user","cwd":"/data/mid-repo","timestamp":"2026-07-23T10:00:00Z","message":{"content":"a different session entirely"}}\n'
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"replacement: gooseberry-anvil"}]}}\n'
+  lines_pad 200; } > "$PROJ/$MID.jsonl"
+test "$(stat -c %s "$PROJ/$MID.jsonl")" -gt "$(jfield "$(ftmeta "$MID")" 0)"
+test "$(ftupdate)" = "[0]"
+python3 "$ENGINE" --find "gooseberry-anvil" | grep -q "claude --resume $MID"
+if python3 "$ENGINE" --find "pumpernickel-lattice" | grep -q "$MID"; then echo "FAIL: stale text after replacement"; exit 1; fi
+
+# 4. the per-session cap is honored: text past it is not indexed, and a full
+#    session is never read again
+CAPD="22222222-3333-4444-8555-666666666666"
+python3 - "$PROJ/$CAPD.jsonl" <<'PY'
+import json, sys
+def w(fh, o): fh.write(json.dumps(o) + "\n")
+with open(sys.argv[1], "w") as fh:
+    w(fh, {"type": "user", "cwd": "/data/cap-repo", "timestamp": "2026-07-22T10:00:00Z",
+           "message": {"content": "capacity planning"}})
+    for i in range(300):  # 300 x 3000 chars = 900k chars, far past the cap
+        t = "record %d " % i + "filler " * 420
+        if i == 10:  t += " earlybird-ferrule"
+        if i == 120: t += " latecomer-ferrule"   # past the cap, outside the head and tail windows
+        w(fh, {"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}})
+PY
+python3 "$ENGINE" --find "earlybird-ferrule" | grep -q "claude --resume $CAPD"
+if python3 "$ENGINE" --find "latecomer-ferrule" | grep -q "$CAPD"; then
+  echo "FAIL: text past the cap was indexed"; exit 1; fi
+MC="$(ftmeta "$CAPD")"; CAP="$(ENGINE="$ENGINE" python3 "$FT" cap)"
+test "$(jfield "$MC" 2)" = 1
+test "$(jfield "$MC" 1)" -le "$CAP"
+test "$(jfield "$MC" 1)" -ge "$((CAP * 9 / 10))"
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"appended to a full session: tardigrade-gimbal"}]}}\n' >> "$PROJ/$CAPD.jsonl"
+test "$(ftupdate)" = "[]"       # a full session is not read again
+test "$(ftmeta "$CAPD")" = "$MC"
+
+# 5. without contentless_delete (SQLite older than 3.43) a row is replaced through
+#    FTS5's 'delete' command; append and replace must behave the same
+H2="$TMP/home2"; P2="$H2/.claude/projects/-data-old"; mkdir -p "$P2"
+cat > "$H2/config.json" <<EOF
+{"accounts":[{"label":"t2","launcher":"claude","projects":"$H2/.claude/projects"}]}
+EOF
+OLDSID="33333333-4444-4555-8666-777777777777"
+{ printf '{"type":"user","cwd":"/data/old","timestamp":"2026-07-22T10:00:00Z","message":{"content":"legacy sqlite path"}}\n'
+  printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"a","content":"first: cormorant-sextant"}]}}\n'
+  lines_pad; } > "$P2/$OLDSID.jsonl"
+legacy() { HOME="$H2" SESSION_ATLAS_CONFIG="$H2/config.json" SESSION_ATLAS_NO_CONTENTLESS_DELETE=1 python3 "$ENGINE" "$@"; }
+legacy --find "cormorant-sextant" | grep -q "claude --resume $OLDSID"
+python3 -c "
+import sqlite3; db=sqlite3.connect('$H2/.cache/session-atlas/index.db')
+assert db.execute(\"SELECT v FROM meta WHERE k='ftx_cd'\").fetchone()[0]=='0'"
+printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"second: halyard-ballast"}]}}\n' >> "$P2/$OLDSID.jsonl"
+legacy --find "halyard-ballast" | grep -q "claude --resume $OLDSID"
+legacy --find "cormorant-sextant" | grep -q "claude --resume $OLDSID"
+{ printf '{"type":"user","cwd":"/data/old","timestamp":"2026-07-24T10:00:00Z","message":{"content":"legacy replaced"}}\n'
+  printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c","content":"third: windlass-spindle"}]}}\n'
+  lines_pad 80; } > "$P2/$OLDSID.jsonl"
+legacy --find "windlass-spindle" | grep -q "claude --resume $OLDSID"
+if legacy --find "cormorant-sextant" | grep -q "$OLDSID"; then echo "FAIL: stale legacy row"; exit 1; fi
+rm -rf "$H2"
+
 echo "smoke ok"

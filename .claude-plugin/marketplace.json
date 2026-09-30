@@ -26,7 +26,7 @@
       "source": "./plugins/session-atlas",
       "description": "The standing map of every Claude Code session on a machine: living HTML pages (search, gists, resume commands) plus an agent-safe find/resolve/import CLI. Multi-account aware, stdlib-only, no credentials — gists are written by your own session's model.",
       "category": "workflow",
-      "version": "1.3.0",
+      "version": "1.4.0",
       "author": {
         "name": "Blackbox AI Labs",
         "email": "blackboxailabs@gmail.com"

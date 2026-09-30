@@ -85,7 +85,7 @@ still works: scans `~/.claude/projects`, writes pages under
 | Verb | What it does |
 |---|---|
 | `/session-atlas:open` | Hand over the ladder page (every session, newest first, density falls with age) |
-| `/session-atlas:find <words>` | Topic search → top matches with resume commands; fork-consult escalation for ambiguity |
+| `/session-atlas:find <words>` | Topic search across titles, prompts and full transcript text → top matches with resume commands; fork-consult escalation for ambiguity |
 | `/session-atlas:resolve <ref>` | Machine-readable resolution (sid, account, launcher, cwd, running?) for other tools |
 | `/session-atlas:import <sid>` | Copy a session into another account to continue it there (operator-gated) |
 | `/session-atlas:refresh` | Summarize changed sessions with this session's model, then rebuild + publish |
@@ -96,7 +96,7 @@ still works: scans `~/.claude/projects`, writes pages under
 - **Ladder** (primary): one vertical timeline, newest first — today fans into a
   column per project, this week in medium cards, this month compact, older weeks
   collapsed. Live search over titles, first prompts, gists, and recent
-  transcript-tail words; a per-day strip jumps anywhere; cards expand to a gist
+  transcript-tail words (the `find` and `resolve` verbs search whole transcripts); a per-day strip jumps anywhere; cards expand to a gist
   + resume command; optional ↻ refresh / ▶ open buttons when a desktop endpoint
   is configured.
 - **Atlas** (secondary): the same scan grouped by project with per-repo
@@ -125,14 +125,26 @@ a gist says where it *stands*, so cards show both when a gist exists.
   bounded work-list to a subagent, `--gist-write` stores the result), so there is
   no API key, endpoint, or model id to configure — and rendering runs on the
   cache with nothing at all.
-- **One index, bounded reads.** Search runs on a local SQLite full-text index
+- **One index, incremental reads.** Search runs on a local SQLite full-text index
   (`~/.cache/session-atlas/index.db`, Python's built-in `sqlite3`) that covers
-  every session of every configured account, not just recent ones. Each call
-  stats the transcripts and re-reads only those that changed, and a re-read
-  takes the first 128 KB and the last 256 KB of the file, never the middle, so
-  an 800k-token session costs the same as a short one. The first run indexes
-  everything once (a few minutes on a large history, on a spinning disk);
-  after that a lookup takes well under a second. `--reindex` rebuilds it.
+  every session of every configured account, not just recent ones. It has two
+  layers. The first holds titles, repo names, first prompts, gists, your prompts
+  and the most frequent words of each session, and answers first. The second
+  holds the text of the whole transcript: your prompts, Claude's replies, the
+  inputs of tool calls and the output of tool results (thinking blocks are left
+  out), so a word that only ever appeared in a command's output, or in the middle
+  of a very long session, still finds that session. Each session keeps at most
+  256,000 characters of transcript text (tool inputs are cut to 500 characters
+  and tool results to 2,000), and a session that reaches that limit is not read
+  again. Search shows title and prompt matches first, then sessions that contain
+  all of your words anywhere in the transcript, then sessions that contain any of
+  them, best match first.
+  Transcripts only ever grow, so each call stats them and reads just the bytes
+  added since the last call; a file that shrank or was replaced is read again
+  from the start. The first run indexes everything once (a few minutes on a
+  large history, longer on a spinning disk); after that a lookup takes well under
+  a second. `--reindex` rebuilds it. The index holds transcript text, so its
+  file is readable only by you.
 - **Agents never read the pages.** The HTML exists for the operator's browser;
   in-session lookups go through `--find`/`--resolve` (a few hundred tokens).
 - **Worktrees are invisible.** Sessions running in `.claude/worktrees/` roll up

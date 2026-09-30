@@ -38,8 +38,16 @@ re-reads only those whose (size, mtime) changed since the last call, and each
 of those reads is bounded: the first HEAD_BYTES and the last TAIL_BYTES of the
 file, never the middle. So the first run pays once for every transcript on the
 machine and every later call pays only for the sessions that moved.
+
+FULL TEXT. Beside that head/tail layer sits a second FTS5 table holding the text
+of the whole transcript: prompts, replies, tool inputs and tool results (thinking
+blocks skipped), capped per session at FT_CAP characters. Transcripts are
+append-only, so it is built incrementally: the byte offset already consumed is
+stored per session, and a grown file is read only from that offset (stopping at
+the last complete line). A file that shrank or whose first bytes changed is
+rebuilt from byte 0. Search tries the head/tail table first, then this one.
 """
-import calendar, glob, html, json, os, re, sqlite3, subprocess, sys, time
+import calendar, glob, html, json, os, re, sqlite3, subprocess, sys, time, zlib
 from collections import Counter
 
 CONFIG_PATH = os.environ.get("SESSION_ATLAS_CONFIG",
@@ -47,12 +55,17 @@ CONFIG_PATH = os.environ.get("SESSION_ATLAS_CONFIG",
 CACHE_DIR = os.path.expanduser("~/.cache/session-atlas")
 CACHE = os.path.join(CACHE_DIR, "summaries.json")
 INDEX = os.path.join(CACHE_DIR, "index.db")
-INDEX_VERSION = 1   # bump when the schema or what a row holds changes -> rebuild
+INDEX_VERSION = 2   # bump when the schema or what a row holds changes -> rebuild
 HEAD_BYTES = 131072    # read from the start of a changed transcript
 TAIL_BYTES = 262144    # read from the end of a changed transcript
 MIN_BYTES = 2000       # smaller transcripts are aborted starts, never indexed
 BODY_CHARS = 8000      # operator prompts kept per session for search
 DEEP_WORDS = 400       # frequency-ranked words kept per session for search
+FT_CAP = 262144        # extracted full-text characters kept per session, then we stop
+FT_TEXT_CHARS = 4000   # per prompt / reply text block
+FT_TOOL_INPUT_CHARS = 500     # per tool call (compact JSON of its input)
+FT_RESULT_CHARS = 2000        # per tool result
+FT_HEAD_CHECK = 64     # leading bytes remembered to tell "same file, grown" from "replaced"
 QUEUE = os.path.join(CACHE_DIR, "gist-queue.json")
 HTML_DIR = os.path.join(CACHE_DIR, "html")
 OUT = os.path.join(HTML_DIR, "session-atlas.html")
@@ -242,6 +255,132 @@ def scan(path, prev=None):
                 body=" \n".join(prompts)[:BODY_CHARS], deep=deep)
 
 
+def _ft_pieces(rec):
+    """Searchable strings from one transcript record: user and assistant text,
+    tool_use inputs (compact, capped) and tool_result content (capped).
+    Thinking blocks, harness reminders and injected (isMeta) turns are skipped."""
+    typ = rec.get("type")
+    if typ not in ("user", "assistant") or rec.get("isMeta"):
+        return
+    m = rec.get("message")
+    content = m.get("content") if isinstance(m, dict) else None
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            t = b.get("text")
+            if isinstance(t, str) and not t.lstrip().startswith(_FT_SKIP):
+                yield t[:FT_TEXT_CHARS]
+        elif bt == "tool_use":
+            name = b.get("name") if isinstance(b.get("name"), str) else ""
+            try:
+                inp = json.dumps(b.get("input"), ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                continue
+            yield (name + " " + inp)[:FT_TOOL_INPUT_CHARS]
+        elif bt == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(x["text"] for x in c if isinstance(x, dict)
+                             and isinstance(x.get("text"), str))
+            if isinstance(c, str):
+                yield c[:FT_RESULT_CHARS]
+
+
+_FT_SKIP = ("<system-reminder>", "<local-command-caveat>")
+
+
+def ft_extract(path, off, room):
+    """Read a transcript from byte `off`, only whole lines, and return
+    (pieces, new_off, capped, head). Stops once `room` characters are gathered
+    (capped=True): the rest of the file is never read. `head` is the file's first
+    FT_HEAD_CHECK bytes, read alongside so the caller can tell a replaced file."""
+    pieces, used, capped = [], 0, False
+    with open(path, "rb") as fh:
+        head = fh.read(FT_HEAD_CHECK)
+        fh.seek(off)
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break  # a record still being written: leave it for the next call
+            off += len(raw)
+            if b'"user"' not in raw and b'"assistant"' not in raw:
+                continue  # cheap pre-filter: skip parsing bookkeeping records
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            for t in _ft_pieces(rec):
+                t = t.strip()
+                if not t:
+                    continue
+                if used + len(t) + 1 > room:
+                    t = t[:max(0, room - used - 1)]
+                    capped = True
+                if t:
+                    pieces.append(t)
+                    used += len(t) + 1
+                if capped:
+                    break
+            if capped:
+                break
+    return pieces, off, capped, head
+
+
+def _ft_forget(db, rid, old_text):
+    """Remove one session's row from the full-text table (a no-op if it has none)."""
+    if old_text is None:
+        return
+    cd = db.execute("SELECT v FROM meta WHERE k='ftx_cd'").fetchone()
+    if cd and cd[0] == "1":
+        db.execute("DELETE FROM ftx WHERE rowid=?", (rid,))
+    else:
+        db.execute("INSERT INTO ftx(ftx, rowid, text) VALUES('delete', ?, ?)",
+                   (rid, old_text))
+
+
+def ft_update(db, rid, path):
+    """Bring one session's full-text row up to date. Appends read only the
+    bytes past the stored offset; a replaced or truncated file starts over."""
+    st = db.execute("SELECT off, head, tlen, capped, z FROM ftmeta WHERE id=?",
+                    (rid,)).fetchone()
+    old = zlib.decompress(st["z"]).decode("utf-8") if st else None
+    size = os.path.getsize(path)
+    keep, off = "", 0
+    if st and size >= st["off"] and st["off"] > 0 and len(old) == st["tlen"]:
+        with open(path, "rb") as fh:
+            same = fh.read(FT_HEAD_CHECK) == st["head"]
+            if same:  # the consumed prefix must still end at a line boundary
+                fh.seek(st["off"] - 1)
+                same = fh.read(1) == b"\n"
+        if same:
+            if st["capped"]:
+                return  # full: nothing more is ever appended
+            keep, off = old, st["off"]
+    pieces, new_off, capped, head = ft_extract(path, off, FT_CAP - len(keep))
+    if off and not pieces:
+        db.execute("UPDATE ftmeta SET off=? WHERE id=?", (new_off, rid))
+        return
+    text = keep + ("\n".join(pieces) + "\n" if pieces else "")
+    _ft_forget(db, rid, old)
+    db.execute("INSERT INTO ftx(rowid, text) VALUES(?,?)", (rid, text))
+    db.execute("INSERT OR REPLACE INTO ftmeta(id, off, head, tlen, capped, z) "
+               "VALUES(?,?,?,?,?,?)",
+               (rid, new_off, head, len(text), int(capped), zlib.compress(text.encode(), 6)))
+
+
+def ft_drop(db, rid):
+    st = db.execute("SELECT z FROM ftmeta WHERE id=?", (rid,)).fetchone()
+    _ft_forget(db, rid, zlib.decompress(st["z"]).decode("utf-8") if st else None)
+    db.execute("DELETE FROM ftmeta WHERE id=?", (rid,))
+
+
 def _repo_of(cwd):
     # worktree cwds (<repo>/.claude/worktrees/<x>) consolidate silently into
     # their parent repo — worktrees are plumbing the operator never sees
@@ -262,7 +401,14 @@ CREATE VIRTUAL TABLE fts USING fts5(
   title, repo, first, summary, gist, body, deep,
   tokenize='porter unicode61 remove_diacritics 2');
 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE ftmeta(
+  id INTEGER PRIMARY KEY, off INTEGER NOT NULL, head BLOB NOT NULL,
+  tlen INTEGER NOT NULL, capped INTEGER NOT NULL DEFAULT 0, z BLOB NOT NULL);
 """
+# The full-text table is contentless (its postings only; the text itself lives
+# zlib-compressed in ftmeta.z, which is what an append needs to rebuild the row):
+# measured at about half the size of an FTS5 table that stores its own copy.
+FTX_COLS = "text, content='', tokenize='porter unicode61 remove_diacritics 2'"
 # bm25 column weights, in fts column order: a title hit outweighs a word
 # somewhere in the transcript
 WEIGHTS = (10.0, 6.0, 3.0, 3.0, 4.0, 1.5, 1.0)
@@ -308,9 +454,23 @@ def _connect():
         if db.execute("PRAGMA user_version").fetchone()[0] == INDEX_VERSION:
             db.rollback()
             return db
-        for tbl in ("sessions", "fts", "meta"):
+        for tbl in ("sessions", "fts", "meta", "ftx", "ftmeta"):
             db.execute("DROP TABLE IF EXISTS %s" % tbl)
-        db.executescript(SCHEMA)  # executescript COMMITs first; fine here
+        for stmt in SCHEMA.split(";"):  # one transaction: no half-built schema is visible
+            if stmt.strip():
+                db.execute(stmt)
+        # contentless_delete (SQLite 3.43+) lets a row be deleted by rowid; without
+        # it the row is deleted by handing FTS5 back the text it was built from
+        cd = os.environ.get("SESSION_ATLAS_NO_CONTENTLESS_DELETE") != "1"
+        try:
+            if not cd:
+                raise sqlite3.OperationalError("contentless_delete disabled")
+            db.execute("CREATE VIRTUAL TABLE ftx USING fts5(%s, contentless_delete=1)"
+                       % FTX_COLS)
+        except sqlite3.OperationalError:
+            cd = False
+            db.execute("CREATE VIRTUAL TABLE ftx USING fts5(%s)" % FTX_COLS)
+        db.execute("INSERT INTO meta VALUES('ftx_cd', ?)", ("1" if cd else "0",))
         db.execute("PRAGMA user_version=%d" % INDEX_VERSION)
         db.commit()
     return db
@@ -403,6 +563,7 @@ def update_index(db):
         if r is None:
             continue
         db.execute("DELETE FROM fts WHERE rowid=?", (r["id"],))
+        ft_drop(db, r["id"])
         db.execute("DELETE FROM sessions WHERE id=?", (r["id"],))
     for n, (path, label, launcher, size, mtime) in enumerate(todo, 1):
         old = db.execute("SELECT * FROM sessions WHERE path=?", (path,)).fetchone()
@@ -436,6 +597,14 @@ def update_index(db):
                    (rid, " ".join(x for x in (f["name"], f["ai_title"]) if x),
                     (repo or "") + " " + (f["cwd"] or ""), f["first"], f["summary"],
                     gist, f["body"], f["deep"]))
+        try:
+            if f["cwd"]:
+                ft_update(db, rid, path)
+            else:
+                ft_drop(db, rid)  # an unparseable stub is never returned; keep it small
+        except Exception as e:  # the full-text layer is best-effort per transcript
+            print("session-atlas: full text skipped for %s (%s: %s)"
+                  % (path, type(e).__name__, e), file=sys.stderr)
         if n % 250 == 0:  # an interrupted first build keeps its progress
             db.commit()
             try:
@@ -1127,8 +1296,11 @@ def _fts_query(terms, op, prefix):
 
 
 def search(db, query, limit):
-    """Tiers, each ranked by bm25: all terms as whole words, then all terms as
-    word prefixes, then any term. The session running this search
+    """Tiers, each ranked by bm25 and deduped against the ones before it:
+    all terms as whole words in the title/prompt layer, all terms as word
+    prefixes there, all terms anywhere in the full transcript text, then any
+    term in the title/prompt layer, then any term in the full text. Later tiers
+    only run while the result list has room. The session running this search
     (CLAUDE_CODE_SESSION_ID) is excluded."""
     terms = [w for w in query.lower().split() if w]
     me = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -1136,11 +1308,19 @@ def search(db, query, limit):
     sql = ("SELECT s.*, bm25(fts, %s) AS score FROM fts JOIN sessions s ON s.id = fts.rowid "
            "WHERE fts MATCH ? AND s.cwd IS NOT NULL AND s.sid != ? "
            "ORDER BY score, s.mtime DESC LIMIT ?" % ", ".join(map(str, WEIGHTS)))
-    for op, prefix in (("AND", False), ("AND", True), ("OR", True)):
+    sql_ft = ("SELECT s.*, bm25(ftx) AS score FROM ftx JOIN sessions s ON s.id = ftx.rowid "
+              "WHERE ftx MATCH ? AND s.cwd IS NOT NULL AND s.sid != ? "
+              "ORDER BY score, s.mtime DESC LIMIT ?")
+    # a session that has every term somewhere in its transcript outranks one
+    # that has some term in its title, so the full-text AND tier comes before
+    # the OR tier of the title/prompt layer
+    for table, op, prefix in (("fts", "AND", False), ("fts", "AND", True),
+                              ("ftx", "AND", False), ("fts", "OR", True),
+                              ("ftx", "OR", False)):
         q = _fts_query(terms, op, prefix)
         if not q or len(out) >= limit or (op == "OR" and len(terms) < 2):
             continue
-        for r in db.execute(sql, (q, me, limit)):
+        for r in db.execute(sql if table == "fts" else sql_ft, (q, me, limit)):
             if r["id"] not in seen:
                 seen.add(r["id"])
                 out.append(_row(r))
@@ -1209,6 +1389,10 @@ def index_status(db):
         print("%s\t%d sessions\t%s .. %s\t%d with gist" % (
             r["acct"], r["n"], time.strftime("%Y-%m-%d", time.localtime(r["lo"])),
             time.strftime("%Y-%m-%d", time.localtime(r["hi"])), r["g"]))
+    r = db.execute("SELECT COUNT(*) n, COALESCE(SUM(tlen), 0) t, COALESCE(SUM(capped), 0) c "
+                   "FROM ftmeta").fetchone()
+    print("fulltext\t%d sessions\t%.1f MB of text\t%d at the %d-char cap" % (
+        r["n"], r["t"] / 1e6, r["c"], FT_CAP))
     print("index\t%s\t%.1f MB" % (INDEX, os.path.getsize(INDEX) / 1e6))
     return 0
 
