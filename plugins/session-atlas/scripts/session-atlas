@@ -1481,10 +1481,7 @@ def refresh_http():
         cwd = (scan(tpath) or {}).get("cwd")
         if not cwd or not os.path.isdir(cwd):
             cwd = os.path.expanduser("~")
-        env = dict(os.environ)
-        env.setdefault("DISPLAY", ":0")
-        env.setdefault("DBUS_SESSION_BUS_ADDRESS",
-                       "unix:path=/run/user/%d/bus" % os.getuid())
+        env = _terminal_env()
         respond(b"200 OK", b"launched on the desktop")
         try:  # let the browser go before the terminal handshake
             os.close(0)
@@ -1541,6 +1538,19 @@ def publish(paths_slugs):
         print(r.stdout.strip() or r.stderr.strip()[-300:])
         rc = rc or r.returncode
     return rc
+
+
+def _terminal_env():
+    """The environment for a reopened session's terminal. Claude Code's own
+    variables are dropped: when this runs from inside a Claude session they
+    would mark the reopened one as its child, and a child session saves no
+    transcript. The launcher sets what it needs."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("CLAUDE", "ANTHROPIC"))}
+    env.setdefault("DISPLAY", ":0")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS",
+                   "unix:path=/run/user/%d/bus" % os.getuid())
+    return env
 
 
 def main():

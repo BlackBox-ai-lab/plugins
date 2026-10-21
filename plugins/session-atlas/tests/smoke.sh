@@ -418,4 +418,15 @@ legacy --find "windlass-spindle" | grep -q "claude --resume $OLDSID"
 if legacy --find "cormorant-sextant" | grep -q "$OLDSID"; then echo "FAIL: stale legacy row"; exit 1; fi
 rm -rf "$H2"
 
+# 6. a session reopened from inside a Claude session must not inherit Claude
+#    Code's variables (they would make it a child session that saves no transcript)
+CLAUDE_CODE_CHILD_SESSION=1 ANTHROPIC_API_KEY=x python3 -c "
+import importlib.machinery, importlib.util, os, sys
+ld = importlib.machinery.SourceFileLoader('sa', sys.argv[1])
+sa = importlib.util.module_from_spec(importlib.util.spec_from_loader('sa', ld)); ld.exec_module(sa)
+env = sa._terminal_env()
+assert 'CLAUDE_CODE_CHILD_SESSION' not in env and 'ANTHROPIC_API_KEY' not in env, sorted(env)
+assert env.get('PATH') == os.environ['PATH'] and 'DISPLAY' in env
+" "$ENGINE"
+
 echo "smoke ok"
